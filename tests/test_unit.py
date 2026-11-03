@@ -456,44 +456,62 @@ class Misc(TempDirTest):
 
 class Reload(TempDirTest):
     def running(self, *entries):
-        """entries: (token, pane_id, zellij_session) of panes whose CLI runs."""
-        return [(token, dict(self.state("claude", [], launched=True), pane_id=pane, zellij_session=session,
-                             core_pid=1000 + index)) for index, (token, pane, session) in enumerate(entries)]
+        """entries: (token, pane_id, zellij_session[, owned]) of panes whose CLI runs."""
+        return [{"pid": 1000 + index, "token": entry[0], "tool": "claude", "owned": entry[3] if len(entry) > 3 else True,
+                 "pane_id": entry[1], "zellij_session": entry[2], "runs": 1}
+                for index, entry in enumerate(entries)]
 
-    def target(self, running, panes, env, name=None):
+    def target(self, running, panes, env, name=None, ancestors=(), keybinding=False):
         store = zjr.Store()
         with mock.patch.object(zjr, "running_panes", return_value=running), \
                 mock.patch.object(zjr, "zellij_panes", return_value=panes), \
+                mock.patch.object(zjr, "ancestors", return_value=list(ancestors)), \
                 mock.patch.dict(os.environ, env, clear=False):
             for key in ("ZJR_PANE", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
                 if key not in env:
                     os.environ.pop(key, None)
-            result = zjr.reload_target(store, name)
-        return result if isinstance(result, str) else result[0]
+            result = zjr.reload_target(store, name, keybinding)
+        return result if isinstance(result, str) else (result["token"], result["pid"])
 
     def layout(self, *panes):
         """panes: (id, tab, focused, floating)."""
         return {str(i): {"id": i, "tab_id": tab, "is_focused": focused, "is_floating": floating, "is_plugin": False}
                 for i, tab, focused, floating in panes}
 
-    def test_inside_the_cli_reloads_its_own_pane(self):
+    def test_inside_the_cli_reloads_the_pane_it_runs_in(self):
         a, b = str(uuid.uuid4()), str(uuid.uuid4())
         running = self.running((a, "1", "s"), (b, "2", "s"))
-        self.assertEqual(self.target(running, None, {"ZJR_PANE": b}), b)
-        self.assertIn("not running", self.target(running, None, {"ZJR_PANE": str(uuid.uuid4())}))
+        self.assertEqual(self.target(running, None, {"ZJR_PANE": b}, ancestors=[77, 1001]), (b, 1001))
+        self.assertIn("not running", self.target(running, None, {"ZJR_PANE": b}, ancestors=[77]))
+
+    def test_a_duplicate_pane_reloads_itself_not_the_original(self):
+        a = str(uuid.uuid4())
+        running = self.running((a, "1", "s", True), (a, "2", "s", False))  # pane 2 runs the same saved command
+        self.assertEqual(self.target(running, None, {"ZJR_PANE": a}, ancestors=[1001]), (a, 1001))
+        panes = self.layout((1, 0, False, False), (2, 0, True, False), (9, 0, True, True))
+        self.assertEqual(self.target(running, panes, {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"},
+                                     keybinding=True), (a, 1001))
+        self.assertEqual(self.target(running, None, {}, name=a[:8]), (a, 1000))  # by name: the original
+
+    def test_keybinding_ignores_the_cli_environment(self):
+        a, b = str(uuid.uuid4()), str(uuid.uuid4())
+        running = self.running((a, "1", "s"), (b, "2", "s"))
+        panes = self.layout((1, 0, True, False), (2, 0, False, False), (9, 0, True, True))
+        env = {"ZJR_PANE": b, "ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}
+        self.assertEqual(self.target(running, panes, env, ancestors=[1001], keybinding=True)[0], a)
 
     def test_keybinding_targets_the_pane_under_the_floating_pane(self):
         a, b = str(uuid.uuid4()), str(uuid.uuid4())
         running = self.running((a, "1", "s"), (b, "2", "s"))
         panes = self.layout((1, 0, False, False), (2, 0, True, False), (9, 0, True, True))  # 9: the keybinding's pane
-        self.assertEqual(self.target(running, panes, {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}), b)
+        self.assertEqual(self.target(running, panes, {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"})[0], b)
 
     def test_single_pane_in_the_tab_and_ambiguity(self):
         a, b, c = (str(uuid.uuid4()) for _ in range(3))
         env = {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}
         one = self.running((a, "1", "s"), (b, "2", "s"))
         panes = self.layout((1, 0, False, False), (2, 1, True, False), (5, 0, True, False), (9, 0, True, True))
-        self.assertEqual(self.target(one, panes, env), a)  # the only one in this tab, though not focused
+        self.assertEqual(self.target(one, panes, env)[0], a)  # the only one in this tab, though not focused
         two = self.running((a, "1", "s"), (c, "3", "s"))
         panes = self.layout((1, 0, False, False), (3, 0, False, False), (5, 0, True, False), (9, 0, True, True))
         self.assertIn("several", self.target(two, panes, env))
@@ -509,8 +527,19 @@ class Reload(TempDirTest):
     def test_by_name(self):
         a, b = "abcdef01-2345-4678-9abc-def012345678", str(uuid.uuid4())
         running = self.running((a, "1", "s"), (b, "2", "s"))
-        self.assertEqual(self.target(running, None, {}, name="abcdef"), a)
+        self.assertEqual(self.target(running, None, {}, name="abcdef")[0], a)
         self.assertIn("0 running panes", self.target(running, None, {}, name="ffff"))
+
+    def test_entries_of_dead_cores_are_removed(self):
+        store = zjr.Store()
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stale = os.path.join(store.running, f"{dead.pid}.json")
+        zjr.write_json(stale, {"pid": dead.pid, "token": str(uuid.uuid4()), "tool": "claude"})
+        mine = os.path.join(store.running, f"{os.getpid()}.json")  # alive, but not a zjr core
+        zjr.write_json(mine, {"pid": os.getpid(), "token": str(uuid.uuid4()), "tool": "claude"})
+        self.assertEqual(zjr.running_panes(store), [])
+        self.assertFalse(os.path.exists(stale) or os.path.exists(mine))
 
     def test_core_pid_is_checked_against_the_process(self):
         token = str(uuid.uuid4())
@@ -559,6 +588,25 @@ class KeybindingConfig(TempDirTest):
         self.assertIn('keybinds {\n    shared_except "locked" {\n        bind "Ctrl Alt r"', text)
         self.assertIn('Run "/opt/x/bin/zjr" "reload" "--from-keybinding"', text)
         self.assertEqual(self.run_admin("keybinding", 'r" { Quit; } bind "x')[0], 2)
+
+    def test_comments_are_comments(self):
+        text = (
+            '/* keybinds { } */\n'
+            'keybinds {  // the real one\n'
+            '    shared_except "locked" {\n'
+            '        /-bind "Alt r" { Run "/opt/x/bin/zjr" "reload"; }\n'
+            '        bind "Alt x" { Run "/a//b" "https://x/*y*/"; }\n'
+            '        /* nested /* comment */ still */\n'
+            '    }\n'
+            '}\n')
+        stripped = zjr.strip_kdl_comments(text)
+        self.assertEqual(len(zjr._keybinds_blocks(stripped)), 1)
+        self.assertIsNone(zjr._reload_binding(stripped))
+        self.assertIn('Run "/a//b" "https://x/*y*/"', stripped)
+        self.assertNotIn("still", stripped)
+        ignored = self.config("/* keybinds {} */\nkeybinds {\n    shared_except \"locked\" {\n        " + self.BIND
+                              + "\n    }\n}\n")
+        self.assertIn("Alt r reloads the focused pane", self.run_admin("doctor", config=ignored)[1])
 
     def test_doctor_spots_a_binding_zellij_ignores(self):
         ignored = self.config("keybinds {\n    normal {\n    }\n}\nkeybinds {\n    shared_except \"locked\" {\n        "

@@ -2,6 +2,7 @@
 processes, a pseudo-terminal per pane, crashes simulated with SIGKILL, and
 the saved command re-run exactly as Zellij would (argv split on spaces)."""
 
+import json
 import os
 import shutil
 import signal
@@ -179,6 +180,18 @@ class ClaudeLauncher(LauncherTest):
 class Reload(LauncherTest):
     tool = "zclaude"
 
+    def running(self, token):
+        """The running/ entries of this pane's cores."""
+        directory = os.path.join(self.box.env["XDG_STATE_HOME"], "zellij-ai-resume", "running")
+        entries = []
+        for name in os.listdir(directory) if os.path.isdir(directory) else []:
+            if name.endswith(".json") and not name.startswith("."):
+                with open(os.path.join(directory, name)) as handle:
+                    entry = json.load(handle)
+                if entry.get("token") == token:
+                    entries.append(entry)
+        return entries
+
     def zjr(self, *args, **extra):
         env = dict(self.box.env, **{key: str(value) for key, value in extra.items()})
         return subprocess.run([self.box.launcher("zjr"), *args], env=env, capture_output=True, text=True, timeout=60)
@@ -198,7 +211,7 @@ class Reload(LauncherTest):
         self.assertEqual(again["argv"], ["--resume", cleared, "--verbose"])
         self.assertNotEqual(again["pid"], first["pid"])
         self.assertEqual(pane.command_line().split(), command)  # same pane process, same saved command
-        self.assertEqual(self.state(token)["runs"], 2)
+        self.assertEqual([entry["runs"] for entry in self.running(token)], [2])
         self.assertIn("\x1b[H\x1b[2J", pane.text())  # the screen was reset between the two
         self.assertIsNone(self.state(token)["failed_resume"])
 
@@ -236,21 +249,55 @@ class Reload(LauncherTest):
         reload.wait(timeout=30)
         time.sleep(1)
         self.assertEqual(len(self.box.events(event="start")), 1)
-        self.assertIsNone(self.state(token)["core_pid"])
+        self.assertEqual(self.running(token), [])
 
     def test_reload_requests_in_quick_succession_are_safe(self):
         pane = self.box.pane([self.box.launcher("zclaude")])
         token = self.saved_command(pane)[3]
         self.box.wait_event(event="start")
-        core = self.state(token)["core_pid"]
+        core = wait_for(lambda: self.running(token), what="running entry")[0]["pid"]
         for _ in range(5):
             os.kill(core, signal.SIGUSR1)
             time.sleep(0.05)
         wait_for(lambda: len(self.box.events(event="start")) >= 2, what="a restart")
+        for _ in range(40):  # keys the terminal sends during the restart, as signals
+            os.kill(core, signal.SIGINT)
+            os.kill(core, signal.SIGQUIT)
+            time.sleep(0.02)
         time.sleep(2)
         self.assertIsNone(pane.proc.poll())  # the pane is still running
-        self.assertEqual(self.state(token)["core_pid"], core)
+        self.assertEqual([entry["pid"] for entry in self.running(token)], [core])
+        self.assertNotIn("Traceback", pane.text())
         self.assertEqual(self.zjr("reload", token).returncode, 0)
+
+    def test_a_wrapper_that_forks_the_cli_is_reloaded_whole(self):
+        wrapper_dir = os.path.join(self.box.dir, "wrapper")
+        os.mkdir(wrapper_dir)
+        with open(os.path.join(wrapper_dir, "claude"), "w") as handle:  # runs the CLI as a child, no exec
+            handle.write(f'#!/bin/sh\n{os.path.join(self.box.fakes, "claude")} "$@"\nexit $?\n')
+        os.chmod(os.path.join(wrapper_dir, "claude"), 0o755)
+        pane = self.box.pane([self.box.launcher("zclaude")], PATH=wrapper_dir + os.pathsep + self.box.env["PATH"])
+        token = self.saved_command(pane)[3]
+        first = self.box.wait_event(event="start")
+        self.assertEqual(self.zjr("reload", token).returncode, 0)
+        self.assertEqual(self.box.wait_event(event="signal")["pid"], first["pid"])  # the real CLI, not just the wrapper
+        again = self.box.wait_event(event="start", skip=1)
+        self.assertEqual(again["argv"][:2], ["--resume", first["session"]])  # not a --fork-session copy
+        alive = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True).stdout.split()
+        self.assertNotIn(str(first["pid"]), alive)
+
+    def test_a_duplicate_pane_reloads_itself(self):
+        owner = self.box.pane([self.box.launcher("zclaude")])
+        command = self.saved_command(owner)
+        original = self.box.wait_event(event="start")
+        output = os.path.join(self.box.dir, "ran.txt")
+        self.box.pane(command, FAKE_RUN_AFTER=1, FAKE_RUN="zjr reload", FAKE_RUN_OUTPUT=output)
+        copy = self.box.wait_event(event="start", skip=1)
+        self.assertIn("--fork-session", copy["argv"])
+        again = self.box.wait_event(event="start", skip=2)
+        self.assertEqual(again["argv"][:2], ["--resume", copy["session"]])  # the duplicate's own conversation
+        self.assertEqual([e["pid"] for e in self.box.events(event="signal")], [copy["pid"]])
+        self.assertNotEqual(again["session"], original["session"])
 
     def test_nothing_to_reload(self):
         done = self.zjr("reload")

@@ -90,7 +90,7 @@ if suspend_after:
     log("suspend")
     os.kill(pid, signal.SIGTSTP)
 run_after = float(os.environ.get("FAKE_RUN_AFTER") or 0)
-if run_after and "--resume" not in args:  # first launch only, or a reload would loop
+if run_after and not os.path.exists(os.environ["FAKE_RUN_OUTPUT"]):  # once, or a reload would loop
     # Like `! some command` typed into Claude Code: a child with the CLI's environment.
     # The command may well end this CLI (zjr reload does), so do not wait for it.
     time.sleep(run_after)

@@ -273,15 +273,33 @@ def open_files(pids: list[int]) -> set[str] | None:
     return {line[1:] for line in output.splitlines() if line.startswith("n/")}
 
 
-def descendants(pid: int) -> list[int]:
-    output = _tool_output("ps", "/bin/ps", ["-A", "-o", "pid=,ppid="])
-    if not output:
-        return []
+def process_table() -> dict[int, tuple[int, str]]:
+    """Every process: pid -> (parent pid, start time). A pid and its start
+    time together name one process, even after the pid is reused."""
+    table: dict[int, tuple[int, str]] = {}
+    for line in (_tool_output("ps", "/bin/ps", ["-A", "-o", "pid=,ppid=,lstart="]) or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), " ".join(parts[2].split()))
+    return table
+
+
+def ancestors(pid: int, table: dict[int, tuple[int, str]] | None = None) -> list[int]:
+    table = process_table() if table is None else table
+    found: list[int] = []
+    while pid in table and len(found) < 64:
+        pid = table[pid][0]
+        if pid <= 1 or pid in found:
+            break
+        found.append(pid)
+    return found
+
+
+def descendants(pid: int, table: dict[int, tuple[int, str]] | None = None) -> list[int]:
+    table = process_table() if table is None else table
     children: dict[int, list[int]] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    for child, (parent, _) in table.items():
+        children.setdefault(parent, []).append(child)
     found, queue = [], [pid]
     while queue and len(found) < 256:
         for child in children.get(queue.pop(0), []):
@@ -390,9 +408,6 @@ def new_state(tool: str, args: list[str], cwd: str) -> dict:
         "failed_resume": None,
         "last_exit": None,
         "zellij_session": os.environ.get("ZELLIJ_SESSION_NAME"),
-        "pane_id": None,
-        "core_pid": None,
-        "runs": 0,
         "created_at": now,
         "updated_at": now,
     }
@@ -433,11 +448,12 @@ class Store:
         self.root = state_root()
         self.panes = os.path.join(self.root, "panes")
         self.locks = os.path.join(self.root, "locks")
+        self.running = os.path.join(self.root, "running")
         self.log_path = os.path.join(self.root, "events.log")
         self.uid = os.getuid()
         try:
             os.makedirs(os.path.dirname(self.root), 0o700, exist_ok=True)
-            for path in (self.root, self.panes, self.locks):
+            for path in (self.root, self.panes, self.locks, self.running):
                 private_dir(path)
         except OSError as error:
             raise StoreError(f"cannot use {self.root}: {error.strerror or error}") from None
@@ -1035,6 +1051,33 @@ class Pane:
             self._lock_session(None)
 
 
+class Running:
+    """This core's entry in running/<pid>.json while it runs: how `zjr
+    reload` finds and checks it. A duplicate pane, which has no state file of
+    its own, has one too."""
+
+    def __init__(self, store: Store, token: str, tool: str, owned: bool) -> None:
+        self.path = os.path.join(store.running, f"{os.getpid()}.json")
+        pane_id = os.environ.get("ZELLIJ_PANE_ID") or ""
+        session = os.environ.get("ZELLIJ_SESSION_NAME") or None
+        self.info = {"pid": os.getpid(), "token": token, "tool": tool, "owned": owned, "runs": 0,
+                     "session_id": None, "pane_id": pane_id if PANE_ID_RE.match(pane_id) else None,
+                     "zellij_session": session if session and len(session) <= 256 else None}
+
+    def update(self, **fields: object) -> None:
+        self.info.update(fields)
+        try:
+            write_json(self.path, self.info)
+        except OSError:
+            pass  # reload cannot find this pane; everything else carries on
+
+    def remove(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
 class Watcher(threading.Thread):
     """Follows which conversation the CLI is on and records it."""
 
@@ -1375,7 +1418,21 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started,
         os.set_blocking(fd, False)
     pending: list = []  # [signal, when to pass it on]
     stopping: list = []  # [when to stop asking] while a reload ends the CLI
+    tree: dict[int, str] = {}  # the CLI's descendants when the reload began: pid -> start time
     signalled = [False]
+
+    def end_tree(signum: int) -> None:
+        # A wrapper may fork the real CLI rather than exec it: signal all of
+        # the CLI's processes, each only while it is the same process (pids
+        # of exited ones can be reused).
+        table = process_table()
+        for pid, started in tree.items():
+            if pid in table and table[pid][1] == started:
+                _signal(pid, signum)
+
+    def tree_alive() -> bool:
+        table = process_table()
+        return any(pid in table and table[pid][1] == started for pid, started in tree.items())
 
     def forward(signum: int, frame: object) -> None:
         # A terminal hangup reaches the whole foreground job, the CLI too:
@@ -1410,10 +1467,14 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started,
                 # Not reaped yet, so the pid is still our child's.
                 if reload[0] and not stopping and not signalled[0]:
                     stopping[:] = [now + RELOAD_GRACE_SECONDS]
+                    table = process_table()
+                    tree.update((child, table[child][1]) for child in descendants(process.pid, table))
                     _signal(process.pid, signal.SIGTERM)
+                    end_tree(signal.SIGTERM)
                 elif stopping and now >= stopping[0]:
                     stopping[:] = [now + 3600.0]
                     _signal(process.pid, signal.SIGKILL)
+                    end_tree(signal.SIGKILL)
                 if pending and now >= pending[1]:
                     _signal(process.pid, pending[0])
                     del pending[:]
@@ -1437,6 +1498,15 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started,
                         pass
                 continue
             process.returncode = exit_code(status)
+            if stopping and not signalled[0]:
+                # Reloading: the new CLI must not share the terminal with what
+                # is left of the old one.
+                deadline = max(stopping[0], time.monotonic() + 0.5) if stopping[0] < now + 3000 else now + 1.0
+                while tree_alive() and not signalled[0] and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if tree_alive() and not signalled[0]:
+                    end_tree(signal.SIGKILL)
+                    time.sleep(0.2)
             return process.returncode, time.monotonic() - began, signalled[0], bool(stopping) and not signalled[0]
     finally:
         signal.set_wakeup_fd(previous_wakeup)
@@ -1508,10 +1578,16 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
     """Run (or resume) the pane's CLI: what `/bin/sh <launcher> --zj-pane <token>`
     does. `zjr reload` (SIGUSR1) restarts the CLI on the same conversation."""
     spec = SPECS[tool]
-    # From here on SIGUSR1 means "reload"; its default action would end this
-    # process, the pane's CLI with it. Requests while not running are moot.
+    # Handlers for as long as this runs, between CLI runs too: SIGUSR1 means
+    # "reload" (its default action would end this process, and the pane's CLI
+    # with it); keys like Ctrl+C belong to the CLI; a hangup ends the loop.
     reload = [False]
+    hangup = [0]
     signal.signal(signal.SIGUSR1, lambda signum, frame: reload.__setitem__(0, True))
+    signal.signal(signal.SIGINT, _ignore)
+    signal.signal(signal.SIGQUIT, _ignore)
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(signum, lambda signum, frame: hangup.__setitem__(0, signum))
     if len(argv) != 2 or argv[0] != PANE_FLAG or not TOKEN_RE.match(argv[1]):
         note(tool, "invalid pane token; starting without recovery")
         return exec_plain(spec, [])
@@ -1534,9 +1610,8 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
     if binary is None:
         note(tool, f"{tool} not found on PATH (press Enter to retry once it is)")
         return 127
-    pane_id = os.environ.get("ZELLIJ_PANE_ID") or ""
-    state.update(binary=binary, core_pid=os.getpid(), zellij_session=os.environ.get("ZELLIJ_SESSION_NAME"),
-                 pane_id=pane_id if PANE_ID_RE.match(pane_id) else None)
+    state.update(binary=binary, zellij_session=os.environ.get("ZELLIJ_SESSION_NAME"))
+    running = Running(store, token, tool, owned)
     try:
         saved_tty = termios.tcgetattr(0) if os.isatty(0) else None
     except termios.error:
@@ -1552,6 +1627,8 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
     code, reloads = 0, 0
     try:
         while True:
+            if hangup[0]:  # between two runs: the pane is going away
+                return 128 + hangup[0]
             plan = make_plan(spec, state, str(uuid.uuid4()), busy)
             if plan.session_id and not pane.lock_session(plan.session_id) and plan.mode == "resume":
                 # Another pane resumed the same conversation a moment ago.
@@ -1565,7 +1642,6 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
                 state["session_id"] = plan.session_id
                 if plan.mode != "resume":
                     state["session_cwd"] = None
-                state["runs"] = int(state.get("runs") or 0) + 1
                 saved = pane._save()
             # Recorded before the CLI starts, so a crash never replays a first
             # launch (and its prompt). If that cannot be recorded, do not track.
@@ -1580,6 +1656,7 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
                 return exec_plain(spec, plan.args)
             store.log("run", token=token, tool=tool, mode=plan.mode, session=plan.session_id, cwd=plan.cwd,
                       owned=owned, reload=reloads)
+            running.update(runs=reloads + 1, session_id=plan.session_id)
 
             watcher: list[Watcher] = []
 
@@ -1589,6 +1666,8 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
                 thread.start()
 
             reload[0] = False
+            if hangup[0]:
+                return 128 + hangup[0]
             try:
                 code, seconds, signalled, reloaded = supervise(spec, binary, plan, child_env(token), started, reload)
             finally:
@@ -1617,9 +1696,7 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
             reloads += 1
             reset_terminal(saved_tty, clear=True)
     finally:
-        with pane.guard:
-            state["core_pid"] = None
-            pane._save()
+        running.remove()
         pane.release()
         pane_lock.release()
 
@@ -1791,10 +1868,76 @@ keybinds {{
 }}"""
 
 
+def _skip_kdl_node(text: str, index: int) -> int:
+    """Where the KDL node starting at index ends (after its { } children)."""
+    depth, quoted = 0, False
+    while index < len(text):
+        char = text[index]
+        if quoted:
+            if char == "\\":
+                index += 1
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                return index  # the end of the enclosing block
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        elif char in "\n;" and depth == 0:
+            return index
+        index += 1
+    return index
+
+
+def strip_kdl_comments(text: str) -> str:
+    """KDL without its comments: // to the end of the line, /* */ (nested),
+    and /- which comments out the next node. Strings are left alone."""
+    out: list[str] = []
+    index, quoted = 0, False
+    while index < len(text):
+        char = text[index]
+        if quoted:
+            out.append(char)
+            if char == "\\" and index + 1 < len(text):
+                out.append(text[index + 1])
+                index += 1
+            elif char == '"':
+                quoted = False
+            index += 1
+        elif char == '"':
+            quoted = True
+            out.append(char)
+            index += 1
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+        elif text.startswith("/*", index):
+            depth, index = 1, index + 2
+            while index < len(text) and depth:
+                if text.startswith("/*", index):
+                    depth, index = depth + 1, index + 2
+                elif text.startswith("*/", index):
+                    depth, index = depth - 1, index + 2
+                else:
+                    if text[index] == "\n":
+                        out.append("\n")
+                    index += 1
+        elif text.startswith("/-", index):
+            index = _skip_kdl_node(text, index + 2)
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
 def _active_kdl(path: str) -> str:
-    """A Zellij config without its // comment lines."""
-    text = (read_file(path, 4 * 1024 * 1024) or b"").decode("utf-8", "replace")
-    return "\n".join("" if line.strip().startswith("//") else line for line in text.splitlines())
+    """A Zellij config without its comments."""
+    return strip_kdl_comments((read_file(path, 4 * 1024 * 1024) or b"").decode("utf-8", "replace"))
 
 
 def _keybinds_blocks(text: str) -> list[int]:
@@ -1811,25 +1954,40 @@ def _is_core(pid: int, token: str) -> bool:
     return "zjr.py" in args and f"{PANE_FLAG} {token}" in args
 
 
-def running_panes(store: Store) -> list[tuple[str, dict]]:
-    """Panes whose CLI runs now, each with its verified core process."""
+def running_panes(store: Store) -> list[dict]:
+    """The running/ entries of cores that run now, each checked to be that
+    pane's core; entries left by a core that died are removed."""
     found = []
-    for token in store.tokens():
-        state = store.load_any(token)
-        pid = state.get("core_pid") if state else None
-        if pid and store.pane_lock(token).held_elsewhere() and _is_core(pid, token):
-            found.append((token, state))
+    try:
+        names = os.listdir(store.running)
+    except OSError:
+        return []
+    for name in names:
+        if not (name.endswith(".json") and name[:-5].isdigit()):
+            continue
+        path, pid = os.path.join(store.running, name), int(name[:-5])
+        entry = read_json(path, MAX_STATE_BYTES, store.uid)
+        token = entry.get("token") if entry else None
+        if (entry and entry.get("pid") == pid and isinstance(token, str) and TOKEN_RE.match(token)
+                and entry.get("tool") in SPECS and pid_alive(pid) and _is_core(pid, token)):
+            found.append(entry)
+        elif not pid_alive(pid) or entry is None or not _is_core(pid, str(token)):
+            try:
+                os.unlink(path)  # its core is gone (or the pid belongs to something else now)
+            except OSError:
+                pass
     return found
 
 
 def _executable(pid: int) -> str | None:
+    """The file a process is running (not its argv[0])."""
     if os.path.isdir("/proc/self"):
         try:
             return os.readlink(f"/proc/{pid}/exe")
         except OSError:
             return None
-    path = ps_field(pid, "comm")  # macOS: the executable's full path
-    return path if path and path.startswith("/") else None
+    output = _tool_output("lsof", "/usr/sbin/lsof", ["-a", "-p", str(pid), "-d", "txt", "-F", "n", "-n", "-P", "-w"])
+    return next((line[1:] for line in (output or "").splitlines() if line.startswith("n/")), None)
 
 
 def zellij_binary() -> str | None:
@@ -1867,21 +2025,24 @@ def zellij_panes(session: str) -> dict[str, dict] | None:
             if isinstance(pane, dict) and not pane.get("is_plugin") and isinstance(pane.get("id"), int)}
 
 
-def reload_target(store: Store, name: str | None) -> tuple[str, dict] | str:
-    """The pane to reload, or why there is none."""
+def reload_target(store: Store, name: str | None, from_keybinding: bool = False) -> dict | str:
+    """The running/ entry of the pane to reload, or why there is none."""
     running = running_panes(store)
     if name:
-        matches = [entry for entry in running if entry[0].startswith(name)]
-        if len(matches) == 1:
-            return matches[0]
+        matches = [entry for entry in running if entry["token"].startswith(name)]
+        owners = [entry for entry in matches if entry.get("owned")]
+        if len(matches) == 1 or len(owners) == 1:
+            return matches[0] if len(matches) == 1 else owners[0]
         return f"{len(matches)} running panes match {name!r} (zjr list shows them)"
-    inside = os.environ.get("ZJR_PANE", "")
-    if TOKEN_RE.match(inside):  # run from inside the CLI, e.g. `! zjr reload` in Claude Code
-        return next((entry for entry in running if entry[0] == inside), "this pane's CLI is not running under zjr")
+    if not from_keybinding and TOKEN_RE.match(os.environ.get("ZJR_PANE", "")):
+        # Run from inside a CLI (`! zjr reload` in Claude Code): its core is an
+        # ancestor of this process, which tells a duplicate pane from the original.
+        mine = set(ancestors(os.getpid()))
+        return next((entry for entry in running if entry["pid"] in mine), "this pane's CLI is not running under zjr")
     session = os.environ.get("ZELLIJ_SESSION_NAME")
     if not session:
         return running[0] if len(running) == 1 else "not inside Zellij: name the pane to reload (zjr list shows them)"
-    here = [entry for entry in running if entry[1].get("zellij_session") == session and entry[1].get("pane_id")]
+    here = [entry for entry in running if entry.get("zellij_session") == session and entry.get("pane_id")]
     if not here:
         return "no zclaude/zcodex pane is running in this Zellij session"
     panes = zellij_panes(session)
@@ -1891,8 +2052,8 @@ def reload_target(store: Store, name: str | None) -> tuple[str, dict] | str:
     # The pane a keybinding's floating pane was opened over stays focused in
     # the tiled layer, so "focused, in this tab, not me" finds it.
     tab = panes[me].get("tab_id")
-    in_tab = [entry for entry in here if entry[1]["pane_id"] in panes and panes[entry[1]["pane_id"]].get("tab_id") == tab]
-    focused = [entry for entry in in_tab if entry[1]["pane_id"] != me and panes[entry[1]["pane_id"]].get("is_focused")]
+    in_tab = [entry for entry in here if entry["pane_id"] in panes and panes[entry["pane_id"]].get("tab_id") == tab]
+    focused = [entry for entry in in_tab if entry["pane_id"] != me and panes[entry["pane_id"]].get("is_focused")]
     if len(focused) == 1:
         return focused[0]
     if len(in_tab) == 1:
@@ -1920,25 +2081,25 @@ def admin_reload(store: Store, argv: list[str]) -> int:
     if len(names) > 1 or (names and not re.match(r"\A[0-9a-f-]{4,36}\Z", names[0])):
         print(ADMIN_USAGE, end="", file=sys.stderr)
         return 2
-    target = reload_target(store, names[0] if names else None)
+    target = reload_target(store, names[0] if names else None, from_keybinding)
     if isinstance(target, str):
         return _reload_failed(target, from_keybinding)
-    token, state = target
-    label = f"{state['tool']} pane {token[:8]}"
-    before = int(state.get("runs") or 0)
+    label = f"{target['tool']} pane {target['token'][:8]}"
+    before = int(target.get("runs") or 0)
     try:
-        os.kill(state["core_pid"], signal.SIGUSR1)
+        os.kill(target["pid"], signal.SIGUSR1)
     except OSError as error:
         return _reload_failed(f"cannot signal {label}: {error.strerror or error}", from_keybinding)
-    if os.environ.get("ZJR_PANE") == token or from_keybinding:
+    if from_keybinding or target["pid"] in ancestors(os.getpid()):
         # Inside the CLI, this command ends along with it; from a keybinding,
         # its floating pane should be gone before the next key. The pane
         # itself says "reloaded; resuming ..." when the CLI is back.
         print(f"reloading {label}")
         return 0
+    entry = os.path.join(store.running, f"{target['pid']}.json")
     deadline = time.monotonic() + RELOAD_GRACE_SECONDS + 10.0
     while time.monotonic() < deadline:
-        current = store.load_any(token)
+        current = read_json(entry, MAX_STATE_BYTES, store.uid)
         if current and int(current.get("runs") or 0) > before:
             conversation = current.get("session_id")
             print(f"reloaded {label}" + (f" on conversation {conversation}" if conversation else ""))

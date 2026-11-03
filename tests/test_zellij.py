@@ -168,7 +168,8 @@ class Resurrection(unittest.TestCase):
         keys(b"\x1bn", 1.5)  # Alt n: a new pane, which takes the focus
         keys(f"{launcher} --model x\r".encode())
         right = self.box.wait_event(event="start", skip=1, timeout=15)
-        wait_for(lambda: len([s for s in self.box.states().values() if s.get("core_pid")]) == 2, what="two running panes")
+        running = os.path.join(self.env["XDG_STATE_HOME"], "zellij-ai-resume", "running")
+        wait_for(lambda: len([n for n in os.listdir(running) if n[0].isdigit()]) == 2, what="two running panes")
 
         def no_floating_pane():
             panes = json.loads(self.action("list-panes", "--json", "--all"))

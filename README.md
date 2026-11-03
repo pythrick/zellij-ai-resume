@@ -50,7 +50,7 @@ it never comes back.
 |---|---|
 | `~/.local/bin/zclaude`, `zcodex`, `zjr` | small `/bin/sh` launchers (generated) |
 | `~/.local/share/zellij-ai-resume/zjr.py` | the core: one Python file, standard library only |
-| `~/.local/state/zellij-ai-resume/` | one 0600 JSON file per pane, lock files, `events.log` (created on first use, 0700) |
+| `~/.local/state/zellij-ai-resume/` | one 0600 JSON file per pane, one per running pane (for reload), lock files, `events.log` (created on first use, 0700) |
 
 Nothing else: no shell rc files, no Zellij, Claude Code or Codex configuration,
 no hooks, no background services. `./uninstall.sh` removes it
