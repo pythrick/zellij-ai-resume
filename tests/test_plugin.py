@@ -28,7 +28,7 @@ PLUGIN = os.path.join(ROOT, "plugin")
 WASM = os.environ.get("ZJR_PLUGIN_WASM") or os.path.join(PLUGIN, "target", "wasm32-wasip1", "release",
                                                           "zellij-ai-resume.wasm")
 SESSION = "zjr-plugin"
-PERMISSIONS = ("ReadApplicationState", "RunCommands", "WriteToStdin", "Reconfigure", "ReadCliPipes")
+PERMISSIONS = ("ReadApplicationState", "RunCommands", "WriteToStdin", "Reconfigure", "ReadCliPipes", "ChangeApplicationState")
 
 
 @unittest.skipUnless(os.environ.get("ZJR_E2E") == "1" and ZELLIJ, "set ZJR_E2E=1 (needs zellij)")
@@ -221,6 +221,23 @@ class Resurrection(PluginTest):
         self.attach()
         fresh = self.box.wait_event(event="start", skip=1, timeout=20)
         self.assertEqual(fresh["argv"], ["--verbose"])
+
+
+class FirstRun(PluginTest):
+    def test_granting_once_in_a_pane_starts_the_background_plugin(self):
+        for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):  # never granted
+            path = os.path.join(self.env["HOME"], cache, "permissions.kdl")
+            if os.path.exists(path):
+                os.unlink(path)
+        client = self.start()
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        session = self.box.wait_event(event="start", timeout=15)["session"]
+        time.sleep(3)
+        self.assertEqual(self.saved(), {})  # the background plugin waits for permission
+        self.zellij("--session", SESSION, "plugin", "--", f"file:{WASM}")  # what the install step says
+        time.sleep(2)
+        os.write(client.master, b"y")
+        self.recorded(session)
 
 
 class Reload(PluginTest):

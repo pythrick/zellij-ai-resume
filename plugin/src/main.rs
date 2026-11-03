@@ -179,6 +179,7 @@ impl ZellijPlugin for State {
             PermissionType::WriteToStdin,
             PermissionType::Reconfigure,
             PermissionType::ReadCliPipes,
+            PermissionType::ChangeApplicationState,
         ]);
         subscribe(&[
             EventType::PermissionRequestResult,
@@ -197,6 +198,16 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(status) => {
                 self.granted = status == PermissionStatus::Granted;
                 self.note(format!("permissions {status:?}"));
+                if self.granted {
+                    // Granted here, in a pane: a background instance that asked
+                    // before still waits for an answer; restarted, it finds the grant.
+                    let me = self.plugin_id;
+                    let stalled: Vec<u32> = self.instances().into_iter().filter(|id| *id < me).collect();
+                    for id in stalled {
+                        reload_plugin_with_id(id);
+                        self.note(format!("restarted instance {id} with the grant"));
+                    }
+                }
             }
             // Background plugins get no ModeUpdate; SessionUpdate names the session too.
             Event::ModeUpdate(info) => {
@@ -298,15 +309,19 @@ impl State {
         self.loaded.map_or(true, |loaded| loaded.elapsed() < RESTORE_WINDOW)
     }
 
-    /// Only one instance acts: the one with the lowest id among the panes of
-    /// this plugin (a background one, and one opened to grant permissions).
-    fn is_leader(&self) -> bool {
+    /// The ids of this plugin's instances (a background one, and one opened
+    /// in a pane to grant permissions, say).
+    fn instances(&self) -> Vec<u32> {
         let all: Vec<&PaneInfo> = self.panes.values().flatten().filter(|pane| pane.is_plugin).collect();
         let Some(url) = all.iter().find(|pane| pane.id == self.plugin_id).and_then(|pane| pane.plugin_url.clone()) else {
-            return true;
+            return vec![self.plugin_id];
         };
-        all.iter().filter(|pane| pane.plugin_url.as_deref() == Some(url.as_str())).map(|pane| pane.id).min()
-            == Some(self.plugin_id)
+        all.iter().filter(|pane| pane.plugin_url.as_deref() == Some(url.as_str())).map(|pane| pane.id).collect()
+    }
+
+    /// Only one instance acts: the one with the lowest id.
+    fn is_leader(&self) -> bool {
+        self.instances().into_iter().min() == Some(self.plugin_id)
     }
 
     fn tick(&mut self) {
