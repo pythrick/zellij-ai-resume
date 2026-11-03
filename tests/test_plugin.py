@@ -176,6 +176,24 @@ class Resurrection(PluginTest):
         self.assertEqual(resumed["argv"], ["resume", "-m", "o3", session])
         self.assertEqual(resumed["cwd"], first["cwd"])
 
+    def test_codex_on_its_shared_daemon_is_found_once_and_kept(self):
+        # Nothing in the pane holds the rollout open: the first one started in
+        # its directory is taken, and a later Codex there does not take over.
+        self.start(FAKE_DAEMON=1, FAKE_ROLLOUT_DELAY=1)
+        self.type(self.terminals()[0]["id"], "mkdir -p proj && cd proj && codex --search")
+        session = self.box.wait_event(tool="codex", event="rollout", timeout=15)["session"]
+        self.recorded(session)
+        other = self.new_pane()
+        self.type(other, "cd proj && codex")
+        later = self.box.wait_event(tool="codex", event="rollout", skip=1, timeout=15)["session"]
+        self.recorded(later)
+        entries = {entry["session_id"]: key for key, entry in self.saved().items()}
+        self.assertEqual(sorted(entries), sorted([session, later]))
+        self.crash_and_attach()
+        wait_for(lambda: len(self.starts("codex")) == 4, timeout=25, what="both back")
+        resumed = {tuple(start["argv"]) for start in self.starts("codex")[2:]}
+        self.assertEqual(resumed, {("resume", "--search", session), ("resume", later)})
+
     def test_several_panes_and_tabs(self):
         self.start(FAKE_ROLLOUT_DELAY=1)
         first = self.terminals()[0]["id"]

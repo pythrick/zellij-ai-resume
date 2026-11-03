@@ -69,7 +69,7 @@ if [ $# -gt 0 ]; then
     fi
     echo '--rollouts--'
     find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -mmin -720 2>/dev/null | while read -r f; do
-        head -c 8192 "$f" | head -n 1 | sed -n 's/.*"timestamp":"\([^"]*\)".*"cwd":"\([^"]*\)".*/\1	\2/p' | sed "s|^|$f	|"
+        head -c 8192 "$f" | awk 'NR == 1 { print; exit }' | sed -n 's/.*"timestamp": *"\([^"]*\)".*"cwd": *"\([^"]*\)".*/\1	\2/p' | sed "s|^|$f	|"
     done
 fi
 "#;
