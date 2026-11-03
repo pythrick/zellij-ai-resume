@@ -1,0 +1,6 @@
+# The toolchain Zellij 0.45.1 itself is built with; rustup installs it for
+# this directory only.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+targets = ["wasm32-wasip1"]

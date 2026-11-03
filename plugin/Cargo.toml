@@ -1,0 +1,16 @@
+[package]
+name = "zellij-ai-resume"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Zellij plugin: resurrected Claude Code / Codex panes resume their conversation"
+
+[dependencies]
+zellij-tile = "0.45.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
