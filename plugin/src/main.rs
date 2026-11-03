@@ -36,6 +36,8 @@ const STALE_COMMAND: Duration = Duration::from_secs(15);
 const MAP_FORMAT: u32 = 1;
 const MAP_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const PIPE_NAME: &str = "zjr-reload";
+/// Marks the commands that enter their directory themselves (see `command_in`).
+const MARKER: &str = "zellij-ai-resume";
 
 /// One host command per tick: the process table, Claude Code's registry, the
 /// files the given process trees hold open, and recent Codex rollouts.
@@ -62,10 +64,11 @@ if [ $# -gt 0 ]; then
         }')
     if [ -d /proc/self/fd ]; then
         for p in $(printf '%s' "$pids" | tr ',' ' '); do
-            for f in /proc/"$p"/fd/*; do printf 'p%s\nn%s\n' "$p" "$(readlink "$f")"; done
+            printf 'p%s\nfcwd\nn%s\n' "$p" "$(readlink /proc/"$p"/cwd)"
+            for f in /proc/"$p"/fd/*; do printf 'f%s\nn%s\n' "${f##*/}" "$(readlink "$f")"; done
         done 2>/dev/null
     else
-        lsof -n -P -w -F pn -p "$pids" 2>/dev/null
+        lsof -n -P -w -F pfn -p "$pids" 2>/dev/null
     fi
     echo '--rollouts--'
     find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -mmin -720 2>/dev/null | while read -r f; do
@@ -382,8 +385,9 @@ impl State {
             }
             let Some(entry) = saved.panes.get(&key) else { continue };
             let words: Vec<String> = pane.terminal_command.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();
-            let Some((tool, _)) = cli::identify(&words) else { continue };
-            if Tool::from_name(&entry.tool) != Some(tool) {
+            let Some(tool) = Tool::from_name(&entry.tool) else { continue };
+            let ours = words.iter().any(|word| word == MARKER) && words.iter().any(|word| word == tool.name());
+            if !ours && cli::identify(&words).map(|found| found.0) != Some(tool) {
                 continue; // something else runs at this position now
             }
             todo.push(Restore { pane: pane.id, key, tool, entry: entry.clone() });
@@ -423,8 +427,8 @@ impl State {
                 }
                 _ => cli::fresh_args(tool, &entry.args), // gone, or it never had a message
             };
-            let command = CommandToRun { path: PathBuf::from(tool.name()), args: args.clone(), cwd: Some(PathBuf::from(&entry.cwd)) };
-            let opened = open_command_pane_in_place_of_pane_id(PaneId::Terminal(restore.pane), command, true, BTreeMap::new());
+            let opened = open_command_pane_in_place_of_pane_id(PaneId::Terminal(restore.pane), command_in(tool, &args, &entry.cwd),
+                                                               true, BTreeMap::new());
             self.note(format!("restored {} as {} {} in {} ({opened:?})", restore.key, tool.name(), args.join(" "), entry.cwd));
         }
     }
@@ -494,21 +498,39 @@ impl State {
             if !running.command_pane {
                 pids.retain(|pid| *pid != running.pane_pid);
             }
+            let mut running = running;
             let (session_id, exact) = match running.tool {
                 Tool::Claude => {
                     let found = registry
                         .iter()
                         .filter(|entry| entry.get("pid").and_then(Value::as_i64).map_or(false, |pid| pids.contains(&(pid as i32))))
                         .max_by_key(|entry| entry.get("startedAt").and_then(Value::as_i64).unwrap_or(0));
+                    if let Some(cwd) = found.and_then(|entry| entry.get("cwd")).and_then(Value::as_str) {
+                        if cwd.starts_with('/') {
+                            running.cwd = cwd.to_string(); // where the conversation runs, from Claude Code itself
+                        }
+                    }
                     match found.and_then(|entry| entry.get("sessionId")).and_then(Value::as_str) {
                         Some(id) if cli::is_uuid(id) => (Some(id.to_string()), true),
                         _ => (previous.and_then(|known| known.session_id.clone()), false),
                     }
                 }
                 Tool::Codex => {
+                    // The CLI is the pane's process (a restored pane) or the
+                    // shell's child; its own directory, as -C is relative to it.
+                    let cli = if running.command_pane {
+                        Some(running.pane_pid)
+                    } else {
+                        pids.iter().copied().filter(|pid| parent.get(pid) == Some(&running.pane_pid)).max()
+                    };
+                    if let Some(cwd) = cli.and_then(|pid| open.cwd.get(&pid)) {
+                        if cwd.starts_with('/') {
+                            running.cwd = cwd.clone();
+                        }
+                    }
                     let held = pids
                         .iter()
-                        .flat_map(|pid| open.get(pid).into_iter().flatten())
+                        .flat_map(|pid| open.files.get(pid).into_iter().flatten())
                         .filter_map(|path| rollout_id(path).map(|id| (path.rsplit('/').next().unwrap_or("").to_string(), id)))
                         .max();
                     match (held, previous) {
@@ -650,8 +672,7 @@ impl State {
         };
         let id = PaneId::Terminal(reload.pane);
         if live.running.command_pane {
-            let command = CommandToRun { path: PathBuf::from(tool.name()), args: args.clone(), cwd: Some(PathBuf::from(&live.running.cwd)) };
-            open_command_pane_in_place_of_pane_id(id, command, true, BTreeMap::new());
+            open_command_pane_in_place_of_pane_id(id, command_in(tool, &args, &live.running.cwd), true, BTreeMap::new());
         } else {
             // Back at the shell's prompt: type the command, after a cd if the
             // shell is elsewhere, and undo terminal modes a killed CLI left on.
@@ -675,6 +696,21 @@ impl State {
 }
 
 // --- helpers --------------------------------------------------------------------------------
+
+/// The command pane that runs the CLI in `cwd`. Zellij maps a plugin's paths
+/// under /host, /data, /cache and /tmp to the plugin's own folders, so a
+/// directory there (a project in /tmp, a server's /data) is entered by the
+/// command itself instead.
+fn command_in(tool: Tool, args: &[String], cwd: &str) -> CommandToRun {
+    let first = cwd.trim_start_matches('/').split('/').next().unwrap_or("");
+    if ["host", "data", "cache", "tmp"].contains(&first) {
+        let mut wrapped = vec!["-c".to_string(), r#"cd -- "$1" && shift && exec "$@""#.to_string(), MARKER.to_string(),
+                               cwd.to_string(), tool.name().to_string()];
+        wrapped.extend(args.iter().cloned());
+        return CommandToRun { path: PathBuf::from("/bin/sh"), args: wrapped, cwd: None };
+    }
+    CommandToRun { path: PathBuf::from(tool.name()), args: args.to_vec(), cwd: Some(PathBuf::from(cwd)) }
+}
 
 fn run(command: &[String], kind: &str) {
     let mut context = BTreeMap::new();
@@ -734,16 +770,30 @@ fn split_sections(output: &str) -> HashMap<String, String> {
     sections
 }
 
-/// lsof -F pn style: "p<pid>" lines, each followed by its "n<path>" lines.
-fn parse_open_files(text: &str) -> HashMap<i32, Vec<String>> {
-    let mut open: HashMap<i32, Vec<String>> = HashMap::new();
-    let mut pid = 0;
+/// What processes have open, lsof -F pfn style ("p<pid>", then "f<fd>" and
+/// "n<path>" pairs): the files of each, and the directory each runs in.
+#[derive(Default)]
+struct OpenFiles {
+    files: HashMap<i32, Vec<String>>,
+    cwd: HashMap<i32, String>,
+}
+
+fn parse_open_files(text: &str) -> OpenFiles {
+    let mut open = OpenFiles::default();
+    let (mut pid, mut fd) = (0, String::new());
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix('p') {
             pid = rest.parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix('f') {
+            fd = rest.to_string();
         } else if let Some(path) = line.strip_prefix('n') {
-            if pid > 0 {
-                open.entry(pid).or_default().push(path.to_string());
+            if pid <= 0 {
+                continue;
+            }
+            if fd == "cwd" {
+                open.cwd.insert(pid, path.to_string());
+            } else {
+                open.files.entry(pid).or_default().push(path.to_string());
             }
         }
     }
@@ -794,7 +844,11 @@ fn map_path(session: &str) -> PathBuf {
 }
 
 fn read_map(session: &str) -> Option<Map> {
-    let map: Map = serde_json::from_str(&fs::read_to_string(map_path(session)).ok()?).ok()?;
+    let mut map: Map = serde_json::from_str(&fs::read_to_string(map_path(session)).ok()?).ok()?;
+    for entry in map.panes.values_mut() {
+        // Only ids this plugin could have written reach a command line.
+        entry.session_id = entry.session_id.take().filter(|id| cli::is_uuid(id));
+    }
     (map.format == MAP_FORMAT).then_some(map)
 }
 
@@ -817,6 +871,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directories_zellij_would_remap_are_entered_by_the_command() {
+        let args = vec!["--verbose".to_string()];
+        let plain = command_in(Tool::Claude, &args, "/home/me/project");
+        assert_eq!((plain.path, plain.args, plain.cwd), (PathBuf::from("claude"), args.clone(), Some(PathBuf::from("/home/me/project"))));
+        let wrapped = command_in(Tool::Claude, &args, "/tmp/project");
+        assert_eq!(wrapped.path, PathBuf::from("/bin/sh"));
+        assert_eq!(wrapped.args[2..], [MARKER, "/tmp/project", "claude", "--verbose"].map(String::from));
+        assert_eq!(wrapped.cwd, None);
+        assert_eq!(command_in(Tool::Codex, &[], "/datastore/x").path, PathBuf::from("codex")); // only whole names
+    }
+
+    #[test]
     fn utc() {
         assert_eq!(parse_utc("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_utc("2026-11-03T19:57:32.884Z"), Some(1793735852));
@@ -828,8 +894,10 @@ mod tests {
         let path = "/h/.codex/sessions/2026/11/03/rollout-2026-11-03T13-57-32-01a020c0-0f51-7e82-9f3b-fab2b4f02036.jsonl";
         assert_eq!(rollout_id(path).as_deref(), Some("01a020c0-0f51-7e82-9f3b-fab2b4f02036"));
         assert_eq!(rollout_id("/h/.codex/log/rollout-x.jsonl"), None);
-        let open = parse_open_files("p12\nn/a\nn/b\np13\nn/c\n");
-        assert_eq!(open[&12], vec!["/a", "/b"]);
+        let open = parse_open_files("p12\nfcwd\nn/work\nf3\nn/a\nf4\nn/b\np13\nf1\nn/c\n");
+        assert_eq!(open.files[&12], vec!["/a", "/b"]);
+        assert_eq!(open.cwd[&12], "/work");
+        assert!(!open.cwd.contains_key(&13));
         let sections = split_sections("1 0\n--claude--\n{}\n--files--\np1\n");
         assert_eq!(sections[""], "1 0\n");
         assert_eq!(sections["files"], "p1\n");

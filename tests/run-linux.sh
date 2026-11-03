@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# tests/run-linux.sh: run the whole test suite, the real-Zellij one included,
-# on Arch Linux ARM in an Apple `container` VM (native on Apple silicon), once
-# with bash and once with dash as /bin/sh.
+# tests/run-linux.sh: run the whole test suite, the real-Zellij ones and the
+# plugin's included, on Arch Linux ARM in an Apple `container` VM (native on
+# Apple silicon), once with bash and once with dash as /bin/sh. The plugin is
+# built here (a .wasm runs anywhere) and mounted into the VM.
 #
 #   brew install container && container system start
 #   tests/run-linux.sh
@@ -21,6 +22,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/sync" "$work/pkg"
+(cd "$root/plugin" && cargo build --release --target wasm32-wasip1 --quiet)
+cp "$root/plugin/target/wasm32-wasip1/release/zellij-ai-resume.wasm" "$work/"
 
 ro() { printf 'type=bind,source=%s,target=%s,readonly' "$1" "$2"; }
 
@@ -41,7 +44,10 @@ pacman -Su --needed --noconfirm --disable-sandbox --cachedir /pkg $packages >/tm
     { tail -20 /tmp/pacman.log; exit 1; }
 echo "\$(uname -srm) | \$(python3 --version) | \$(zellij --version) | \$(ps --version | head -1)"
 useradd -m tester
-cp -a /src /home/tester/zjr && rm -rf /home/tester/zjr/*/__pycache__ && chown -R tester: /home/tester/zjr
+mkdir /home/tester/zjr
+tar -C /src --exclude=./plugin/target --exclude='*/__pycache__' -cf - . | tar -C /home/tester/zjr -xf -
+cp /work/zellij-ai-resume.wasm /home/tester/zjr/plugin/zellij-ai-resume.wasm
+chown -R tester: /home/tester/zjr
 status=0
 for sh in bash dash; do
     ln -sf \$sh /usr/bin/sh
@@ -49,7 +55,7 @@ for sh in bash dash; do
     for file in install.sh uninstall.sh src/launcher.sh.in src/zjr.sh.in; do
         /bin/sh -n /home/tester/zjr/\$file || status=1
     done
-    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 python3 -W error::DeprecationWarning -m unittest test_unit test_launcher test_zellij' || status=1
+    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 ZJR_PLUGIN_WASM=/home/tester/zjr/plugin/zellij-ai-resume.wasm python3 -W error::DeprecationWarning -m unittest test_unit test_launcher test_zellij test_plugin' || status=1
 done
 exit \$status
 EOF
