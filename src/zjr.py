@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import uuid
@@ -57,6 +58,7 @@ MAX_LOG_BYTES = 512 * 1024
 TOKEN_RE = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 # Conversation ids come from the CLIs (Claude Code: uuid4, Codex: uuid7).
 SESSION_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+PANE_ID_RE = re.compile(r"\A[0-9]{1,9}\Z")  # ZELLIJ_PANE_ID
 LOCK_NAME_RE = re.compile(r"\A(pane|claude|codex)-[0-9a-fA-F-]{36}\.lock\Z")
 # The format of `ps -o lstart`, which Claude Code also uses for procStart.
 LSTART_RE = re.compile(r"\A[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d \d{4}\Z")
@@ -388,6 +390,9 @@ def new_state(tool: str, args: list[str], cwd: str) -> dict:
         "failed_resume": None,
         "last_exit": None,
         "zellij_session": os.environ.get("ZELLIJ_SESSION_NAME"),
+        "pane_id": None,
+        "core_pid": None,
+        "runs": 0,
         "created_at": now,
         "updated_at": now,
     }
@@ -410,6 +415,13 @@ def validate_state(value: object, tool: str) -> dict | None:
     for key in ("session_id", "failed_resume"):
         if value.get(key) is not None and not is_session_id(value.get(key)):
             return None
+    for key in ("core_pid", "runs"):
+        number = value.get(key)
+        if number is not None and (not isinstance(number, int) or isinstance(number, bool) or number < 0):
+            return None
+    pane_id = value.get("pane_id")
+    if pane_id is not None and not (isinstance(pane_id, str) and PANE_ID_RE.match(pane_id)):
+        return None
     return value
 
 
@@ -953,7 +965,11 @@ class Pane:
 
     def claimed_elsewhere(self, session_id: str) -> bool:
         try:
-            return self.store.session_lock(self.spec.name, session_id).held_elsewhere()
+            lock = self.store.session_lock(self.spec.name, session_id)
+            with self.guard:
+                if self.session_lock is not None and self.session_lock.path == lock.path:
+                    return False  # held by this pane
+            return lock.held_elsewhere()
         except (OSError, StoreError, ValueError):
             return True
 
@@ -964,6 +980,9 @@ class Pane:
             return self._lock_session(session_id)
 
     def _lock_session(self, session_id: str | None) -> bool:
+        if session_id is not None and self.session_lock is not None:
+            if self.session_lock.path == self.store.session_lock(self.spec.name, session_id).path:
+                return True  # already ours: never let go of it in between
         previous, self.session_lock = self.session_lock, None
         if previous is not None:
             previous.release()
@@ -1301,10 +1320,53 @@ def _still_stopped(pid: int) -> bool:
     return bool(state) and state.startswith("T")
 
 
-def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started) -> tuple[int, float, bool]:
-    """Run the CLI in the foreground of this terminal and wait for it;
-    returns its exit status, how long it ran, and whether a hangup or
-    termination signal arrived on the way.
+RELOAD_GRACE_SECONDS = 5.0
+
+# Leave modes a CLI may have set and not undone (Codex, for one, leaves
+# them all on when it is killed): alternate screen, mouse and focus
+# reporting, bracketed paste, the kitty keyboard protocol, application cursor
+# keys, attributes, a hidden cursor, autowrap, the scroll region (whose reset
+# homes the cursor, hence the save and restore around it).
+TERMINAL_RESET = (
+    b"\x1b[?1049l"
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+    b"\x1b[?1004l\x1b[?2004l"
+    b"\x1b[<u"
+    b"\x1b[?1l\x1b>"
+    b"\x1b[0m\x1b[?25h\x1b[?7h"
+    b"\x1b7\x1b[r\x1b8"
+)
+CLEAR_SCREEN = b"\x1b[H\x1b[2J"
+
+
+def reset_terminal(saved: list | None, clear: bool) -> None:
+    """Put the terminal back as it was before the CLI started, if this job
+    owns it (from the background, tcsetattr would stop us with SIGTTOU or
+    change the modes under whatever runs in the foreground)."""
+    try:
+        if not (os.isatty(1) and os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp()):
+            return
+    except OSError:
+        return
+    if saved is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, saved)
+        except (termios.error, OSError):
+            pass
+    try:
+        os.write(1, TERMINAL_RESET + (CLEAR_SCREEN if clear else b""))
+    except OSError:
+        pass
+
+
+def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started,
+              reload: list[bool]) -> tuple[int, float, bool, bool]:
+    """Run the CLI in the foreground of this terminal and wait for it.
+
+    Returns its exit status, how long it ran, whether a hangup or
+    termination signal arrived on the way, and whether it was stopped for a
+    reload (reload[0] set by SIGUSR1: SIGTERM, then SIGKILL after a grace
+    period).
 
     Signal handlers only take note; waiting for the CLI and signalling it
     both happen on this thread, so a pid is never signalled once reaped."""
@@ -1312,6 +1374,7 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started) -> tu
     for fd in (wake_read, wake_write):
         os.set_blocking(fd, False)
     pending: list = []  # [signal, when to pass it on]
+    stopping: list = []  # [when to stop asking] while a reload ends the CLI
     signalled = [False]
 
     def forward(signum: int, frame: object) -> None:
@@ -1331,7 +1394,7 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started) -> tu
             process = subprocess.Popen([spec.name, *plan.args], executable=binary, cwd=plan.cwd, env=env, close_fds=True)
         except OSError as error:
             note(spec.name, f"cannot run {binary}: {error.strerror or error}")
-            return 127, 0.0, False
+            return 127, 0.0, False, False
         try:
             started(process.pid)
         except Exception as error:  # still wait for the CLI, just untracked
@@ -1341,15 +1404,21 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started) -> tu
                 pid, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
             except ChildProcessError:
                 code = process.returncode if process.returncode is not None else 1
-                return code, time.monotonic() - began, signalled[0]
+                return code, time.monotonic() - began, signalled[0], bool(stopping) and not signalled[0]
+            now = time.monotonic()
             if pid == 0:
-                if pending and time.monotonic() >= pending[1]:
-                    try:
-                        os.kill(process.pid, pending[0])  # not reaped yet: still our child
-                    except OSError:
-                        pass
+                # Not reaped yet, so the pid is still our child's.
+                if reload[0] and not stopping and not signalled[0]:
+                    stopping[:] = [now + RELOAD_GRACE_SECONDS]
+                    _signal(process.pid, signal.SIGTERM)
+                elif stopping and now >= stopping[0]:
+                    stopping[:] = [now + 3600.0]
+                    _signal(process.pid, signal.SIGKILL)
+                if pending and now >= pending[1]:
+                    _signal(process.pid, pending[0])
                     del pending[:]
-                timeout = max(0.0, pending[1] - time.monotonic()) if pending else None
+                deadlines = [entry[-1] for entry in (pending, stopping) if entry]
+                timeout = max(0.0, min(deadlines) - now) if deadlines else None
                 select.select([wake_read], [], [], timeout)  # any signal, SIGCHLD included, wakes this
                 try:
                     while os.read(wake_read, 512):
@@ -1368,13 +1437,20 @@ def supervise(spec, binary: str, plan: Plan, env: dict[str, str], started) -> tu
                         pass
                 continue
             process.returncode = exit_code(status)
-            return process.returncode, time.monotonic() - began, signalled[0]
+            return process.returncode, time.monotonic() - began, signalled[0], bool(stopping) and not signalled[0]
     finally:
         signal.set_wakeup_fd(previous_wakeup)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
         os.close(wake_read)
         os.close(wake_write)
+
+
+def _signal(pid: int, signum: int) -> None:
+    try:
+        os.kill(pid, signum)
+    except OSError:
+        pass
 
 
 def launcher_problem(launcher: str) -> str | None:
@@ -1429,8 +1505,13 @@ def start(tool: str, launcher: str, args: list[str]) -> int:
 
 
 def run(tool: str, launcher: str, argv: list[str]) -> int:
-    """Run (or resume) the pane's CLI: what `/bin/sh <launcher> --zj-pane <token>` does."""
+    """Run (or resume) the pane's CLI: what `/bin/sh <launcher> --zj-pane <token>`
+    does. `zjr reload` (SIGUSR1) restarts the CLI on the same conversation."""
     spec = SPECS[tool]
+    # From here on SIGUSR1 means "reload"; its default action would end this
+    # process, the pane's CLI with it. Requests while not running are moot.
+    reload = [False]
+    signal.signal(signal.SIGUSR1, lambda signum, frame: reload.__setitem__(0, True))
     if len(argv) != 2 or argv[0] != PANE_FLAG or not TOKEN_RE.match(argv[1]):
         note(tool, "invalid pane token; starting without recovery")
         return exec_plain(spec, [])
@@ -1453,68 +1534,94 @@ def run(tool: str, launcher: str, argv: list[str]) -> int:
     if binary is None:
         note(tool, f"{tool} not found on PATH (press Enter to retry once it is)")
         return 127
-    state["binary"] = binary
+    pane_id = os.environ.get("ZELLIJ_PANE_ID") or ""
+    state.update(binary=binary, core_pid=os.getpid(), zellij_session=os.environ.get("ZELLIJ_SESSION_NAME"),
+                 pane_id=pane_id if PANE_ID_RE.match(pane_id) else None)
+    try:
+        saved_tty = termios.tcgetattr(0) if os.isatty(0) else None
+    except termios.error:
+        saved_tty = None
 
     pane = Pane(store, token, state, spec, owned)
+    copied_from = state.get("session_id")  # what the owning pane has open, when this one is a duplicate
 
     def busy(session_id: str) -> bool:
-        return not owned or pane.claimed_elsewhere(session_id) or spec.open_elsewhere(session_id)
+        return ((not owned and session_id == copied_from) or pane.claimed_elsewhere(session_id)
+                or spec.open_elsewhere(session_id))
 
-    plan = make_plan(spec, state, str(uuid.uuid4()), busy)
-    if owned and plan.session_id and not pane.lock_session(plan.session_id) and plan.mode == "resume":
-        # Another pane resumed the same conversation a moment ago.
-        kept = spec.split(spec.parse(state["args"]), state)[0]
-        plan = Plan("fork", spec.resume_args(plan.session_id, kept, fork=True), plan.cwd, None,
-                    f"conversation {plan.session_id} is open elsewhere; continuing in a copy of it")
-    if plan.message:
-        note(tool, plan.message)
-
-    state["launched"] = True
-    state["session_id"] = plan.session_id
-    if plan.mode != "resume":
-        state["session_cwd"] = None
-    # Recorded before the CLI starts, so a crash never replays a first launch
-    # (and its prompt). If that cannot be recorded, do not track this pane.
-    if not pane.save() and plan.mode == "first":
-        try:
-            store.delete(token)
-        except OSError:
-            pass
-        note(tool, "starting without recovery")
-        pane_lock.release()
-        return exec_plain(spec, plan.args)
-    store.log("run", token=token, tool=tool, mode=plan.mode, session=plan.session_id, cwd=plan.cwd, owned=owned)
-
-    watcher: list[Watcher] = []
-
-    def started(pid: int) -> None:
-        thread = spec.watcher(pane, pid, plan) if owned else Watcher(None, pid)
-        watcher.append(thread)
-        thread.start()
-
+    code, reloads = 0, 0
     try:
-        code, seconds, signalled = supervise(spec, binary, plan, child_env(token), started)
+        while True:
+            plan = make_plan(spec, state, str(uuid.uuid4()), busy)
+            if plan.session_id and not pane.lock_session(plan.session_id) and plan.mode == "resume":
+                # Another pane resumed the same conversation a moment ago.
+                kept = spec.split(spec.parse(state["args"]), state)[0]
+                plan = Plan("fork", spec.resume_args(plan.session_id, kept, fork=True), plan.cwd, None,
+                            f"conversation {plan.session_id} is open elsewhere; continuing in a copy of it")
+            if plan.message:
+                note(tool, ("reloaded; " if reloads else "") + plan.message)
+            with pane.guard:
+                state["launched"] = True
+                state["session_id"] = plan.session_id
+                if plan.mode != "resume":
+                    state["session_cwd"] = None
+                state["runs"] = int(state.get("runs") or 0) + 1
+                saved = pane._save()
+            # Recorded before the CLI starts, so a crash never replays a first
+            # launch (and its prompt). If that cannot be recorded, do not track.
+            if not saved and plan.mode == "first":
+                try:
+                    store.delete(token)
+                except OSError:
+                    pass
+                note(tool, "starting without recovery")
+                pane.release()
+                pane_lock.release()
+                return exec_plain(spec, plan.args)
+            store.log("run", token=token, tool=tool, mode=plan.mode, session=plan.session_id, cwd=plan.cwd,
+                      owned=owned, reload=reloads)
+
+            watcher: list[Watcher] = []
+
+            def started(pid: int) -> None:
+                thread = spec.watcher(pane, pid, plan)  # a duplicate pane tracks too, in memory only
+                watcher.append(thread)
+                thread.start()
+
+            reload[0] = False
+            try:
+                code, seconds, signalled, reloaded = supervise(spec, binary, plan, child_env(token), started, reload)
+            finally:
+                if watcher:
+                    watcher[0].finish()
+            # A resume that failed at once (Claude Code: "No conversation
+            # found") is not retried. Being closed, killed, interrupted or
+            # reloaded is not a failure.
+            failed = (plan.mode == "resume" and 0 < code < 128 and seconds < FAST_FAIL_SECONDS and not signalled
+                      and not reloaded and state.get("session_id") == plan.session_id)
+            with pane.guard:
+                state["last_exit"] = code
+                if failed:
+                    state["failed_resume"] = plan.session_id
+                elif state.get("failed_resume") and (seconds >= FAST_FAIL_SECONDS or reloaded):
+                    state["failed_resume"] = None
+                pane._save()
+            store.log("exit", token=token, tool=tool, code=code, seconds=round(seconds, 1), reload=reloaded)
+            if failed:
+                note(tool, f"{tool} exited at once while resuming {plan.session_id}; "
+                           f"press Enter to start a new conversation instead")
+            if not reloaded:
+                if code >= 128:  # killed: it may not have undone its terminal modes
+                    reset_terminal(saved_tty, clear=False)
+                return code
+            reloads += 1
+            reset_terminal(saved_tty, clear=True)
     finally:
-        if watcher:
-            watcher[0].finish()
-    # A resume that failed at once (Claude Code: "No conversation found") is
-    # not retried. Being closed, killed or interrupted is not a failure.
-    failed = (plan.mode == "resume" and 0 < code < 128 and seconds < FAST_FAIL_SECONDS and not signalled
-              and state.get("session_id") == plan.session_id)
-    with pane.guard:
-        state["last_exit"] = code
-        if failed:
-            state["failed_resume"] = plan.session_id
-        elif state.get("failed_resume") and seconds >= FAST_FAIL_SECONDS:
-            state["failed_resume"] = None
-        pane._save()
-    if failed:
-        note(tool, f"{tool} exited at once while resuming {plan.session_id}; "
-                   f"press Enter to start a new conversation instead")
-    pane.release()
-    pane_lock.release()
-    store.log("exit", token=token, tool=tool, code=code, seconds=round(seconds, 1))
-    return code
+        with pane.guard:
+            state["core_pid"] = None
+            pane._save()
+        pane.release()
+        pane_lock.release()
 
 
 # --- zjr: inspection and upkeep ---------------------------------------------------------
@@ -1619,6 +1726,16 @@ def admin_doctor(store: Store | None, bindir: str) -> int:
                                    f"commands containing {PANE_FLAG} unchanged")
         else:
             report(True, "config", f"{_home_short(config)}: session serialization on")
+        active_text = _active_kdl(config)
+        bound, blocks = _reload_binding(active_text), _keybinds_blocks(active_text)
+        if bound and len(blocks) > 1 and bound.start() > blocks[1]:
+            report(False, "reload", f"{bound.group(1)} is bound in a second `keybinds` block, which Zellij "
+                                    "ignores: move the bind into the first one")
+        elif bound:
+            report(True, "reload", f"{bound.group(1)} reloads the focused pane")
+        else:
+            report(True, "reload", "no shortcut (optional: zjr keybinding prints one); "
+                                   "`! zjr reload` works inside Claude Code")
     else:
         report(True, "config", "Zellij defaults (session serialization on)")
 
@@ -1639,14 +1756,211 @@ def admin_doctor(store: Store | None, bindir: str) -> int:
     return 1 if problems else 0
 
 
-ADMIN_USAGE = """usage: zjr [list|doctor|gc [--days N]|forget PANE|version]
+ADMIN_USAGE = """usage: zjr [list|reload [PANE]|keybinding [KEY]|doctor|gc [--days N]|forget PANE|version]
 
-  list            panes zclaude/zcodex can restore (default)
-  doctor          check the installation and environment
-  gc [--days N]   forget panes untouched for N days (default 30)
-  forget PANE     forget one pane (a prefix of its id from `zjr list`)
-  version         print the version
+  list              panes zclaude/zcodex can restore (default)
+  reload [PANE]     restart a pane's CLI on the conversation it is on: the pane
+                    this runs in (`! zjr reload` inside Claude Code), else the
+                    focused zclaude/zcodex pane of this Zellij tab, or PANE
+  keybinding [KEY]  print a Zellij keybinding for reload (default: Alt r)
+  doctor            check the installation and environment
+  gc [--days N]     forget panes untouched for N days (default 30)
+  forget PANE       forget one pane (a prefix of its id from `zjr list`)
+  version           print the version
 """
+
+KEYBINDING_BIND = """bind "{key}" {{
+    Run "{zjr}" "reload" "--from-keybinding" {{
+        floating true
+        close_on_exit true
+    }}
+}}"""
+
+KEYBINDING_INTO = """// zellij-ai-resume: {key} restarts the focused zclaude/zcodex pane on its current
+// conversation. {config} already has a `keybinds` block, and Zellij ignores a
+// second one: put this `bind` inside that block, in its `shared_except "locked"`
+// section (add the section if there is none).
+"""
+
+KEYBINDING_NEW = """// zellij-ai-resume: {key} restarts the focused zclaude/zcodex pane on its current
+// conversation. Add this to {config} (create the file if it does not exist).
+keybinds {{
+    shared_except "locked" {{
+{bind}
+    }}
+}}"""
+
+
+def _active_kdl(path: str) -> str:
+    """A Zellij config without its // comment lines."""
+    text = (read_file(path, 4 * 1024 * 1024) or b"").decode("utf-8", "replace")
+    return "\n".join("" if line.strip().startswith("//") else line for line in text.splitlines())
+
+
+def _keybinds_blocks(text: str) -> list[int]:
+    return [match.start() for match in re.finditer(r"(?m)^[ \t]*keybinds\b", text)]
+
+
+def _reload_binding(text: str) -> re.Match | None:
+    return re.search(r'bind\s+"([^"]+)"\s*\{[^}]*?Run\s+"[^"]*/zjr"\s+"reload"', text)
+
+
+def _is_core(pid: int, token: str) -> bool:
+    """Whether pid is the core running this pane, not a reused pid."""
+    args = ps_field(pid, "args") or ""
+    return "zjr.py" in args and f"{PANE_FLAG} {token}" in args
+
+
+def running_panes(store: Store) -> list[tuple[str, dict]]:
+    """Panes whose CLI runs now, each with its verified core process."""
+    found = []
+    for token in store.tokens():
+        state = store.load_any(token)
+        pid = state.get("core_pid") if state else None
+        if pid and store.pane_lock(token).held_elsewhere() and _is_core(pid, token):
+            found.append((token, state))
+    return found
+
+
+def _executable(pid: int) -> str | None:
+    if os.path.isdir("/proc/self"):
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+    path = ps_field(pid, "comm")  # macOS: the executable's full path
+    return path if path and path.startswith("/") else None
+
+
+def zellij_binary() -> str | None:
+    """zellij on PATH, else the binary of the Zellij server this process
+    runs under (a server's PATH need not include it)."""
+    found = shutil.which("zellij")
+    if found:
+        return found
+    pid = os.getpid()
+    for _ in range(16):
+        parent = ps_field(pid, "ppid")
+        if not parent or not parent.isdigit() or int(parent) <= 1:
+            return None
+        pid = int(parent)
+        path = _executable(pid)
+        if path and os.path.basename(path) == "zellij" and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def zellij_panes(session: str) -> dict[str, dict] | None:
+    """The terminal panes of a Zellij session by pane id, or None."""
+    zellij = zellij_binary()
+    if not zellij:
+        return None
+    try:
+        result = subprocess.run([zellij, "--session", session, "action", "list-panes", "--json", "--all"],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+        panes = json.loads(result.stdout.decode("utf-8")) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(panes, list):
+        return None
+    return {str(pane["id"]): pane for pane in panes
+            if isinstance(pane, dict) and not pane.get("is_plugin") and isinstance(pane.get("id"), int)}
+
+
+def reload_target(store: Store, name: str | None) -> tuple[str, dict] | str:
+    """The pane to reload, or why there is none."""
+    running = running_panes(store)
+    if name:
+        matches = [entry for entry in running if entry[0].startswith(name)]
+        if len(matches) == 1:
+            return matches[0]
+        return f"{len(matches)} running panes match {name!r} (zjr list shows them)"
+    inside = os.environ.get("ZJR_PANE", "")
+    if TOKEN_RE.match(inside):  # run from inside the CLI, e.g. `! zjr reload` in Claude Code
+        return next((entry for entry in running if entry[0] == inside), "this pane's CLI is not running under zjr")
+    session = os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        return running[0] if len(running) == 1 else "not inside Zellij: name the pane to reload (zjr list shows them)"
+    here = [entry for entry in running if entry[1].get("zellij_session") == session and entry[1].get("pane_id")]
+    if not here:
+        return "no zclaude/zcodex pane is running in this Zellij session"
+    panes = zellij_panes(session)
+    me = os.environ.get("ZELLIJ_PANE_ID", "")
+    if panes is None or me not in panes:
+        return here[0] if len(here) == 1 else "several zclaude/zcodex panes are running: name one (zjr list shows them)"
+    # The pane a keybinding's floating pane was opened over stays focused in
+    # the tiled layer, so "focused, in this tab, not me" finds it.
+    tab = panes[me].get("tab_id")
+    in_tab = [entry for entry in here if entry[1]["pane_id"] in panes and panes[entry[1]["pane_id"]].get("tab_id") == tab]
+    focused = [entry for entry in in_tab if entry[1]["pane_id"] != me and panes[entry[1]["pane_id"]].get("is_focused")]
+    if len(focused) == 1:
+        return focused[0]
+    if len(in_tab) == 1:
+        return in_tab[0]
+    if in_tab:
+        return "the focused pane is not a zclaude/zcodex pane, and this tab has several"
+    return "no zclaude/zcodex pane is running in this tab"
+
+
+def _reload_failed(message: str, from_keybinding: bool) -> int:
+    print(f"zjr reload: {message}", file=sys.stderr)
+    if from_keybinding and os.isatty(0):
+        # The keybinding's floating pane closes when this exits: keep the message up.
+        print("(Enter closes this)", file=sys.stderr)
+        try:
+            select.select([0], [], [], 15)
+        except (OSError, ValueError):
+            pass
+    return 1
+
+
+def admin_reload(store: Store, argv: list[str]) -> int:
+    from_keybinding = "--from-keybinding" in argv
+    names = [arg for arg in argv if arg != "--from-keybinding"]
+    if len(names) > 1 or (names and not re.match(r"\A[0-9a-f-]{4,36}\Z", names[0])):
+        print(ADMIN_USAGE, end="", file=sys.stderr)
+        return 2
+    target = reload_target(store, names[0] if names else None)
+    if isinstance(target, str):
+        return _reload_failed(target, from_keybinding)
+    token, state = target
+    label = f"{state['tool']} pane {token[:8]}"
+    before = int(state.get("runs") or 0)
+    try:
+        os.kill(state["core_pid"], signal.SIGUSR1)
+    except OSError as error:
+        return _reload_failed(f"cannot signal {label}: {error.strerror or error}", from_keybinding)
+    if os.environ.get("ZJR_PANE") == token or from_keybinding:
+        # Inside the CLI, this command ends along with it; from a keybinding,
+        # its floating pane should be gone before the next key. The pane
+        # itself says "reloaded; resuming ..." when the CLI is back.
+        print(f"reloading {label}")
+        return 0
+    deadline = time.monotonic() + RELOAD_GRACE_SECONDS + 10.0
+    while time.monotonic() < deadline:
+        current = store.load_any(token)
+        if current and int(current.get("runs") or 0) > before:
+            conversation = current.get("session_id")
+            print(f"reloaded {label}" + (f" on conversation {conversation}" if conversation else ""))
+            return 0
+        time.sleep(0.1)
+    return _reload_failed(f"{label} did not restart", from_keybinding)
+
+
+def admin_keybinding(bindir: str, argv: list[str]) -> int:
+    key = " ".join(argv) if argv else "Alt r"
+    if not re.match(r"\A[A-Za-z0-9 +-]{1,32}\Z", key):
+        print("zjr keybinding: KEY looks like Alt r, Ctrl Alt r, F5 ...", file=sys.stderr)
+        return 2
+    existing = _zellij_config()
+    config = existing or os.path.join(os.path.expanduser("~"), ".config", "zellij", "config.kdl")
+    bind = KEYBINDING_BIND.format(key=key, zjr=os.path.join(bindir, "zjr"))
+    if existing and _keybinds_blocks(_active_kdl(existing)):
+        print(KEYBINDING_INTO.format(key=key, config=_home_short(config)) + bind)
+    else:
+        indented = "\n".join("        " + line for line in bind.splitlines())
+        print(KEYBINDING_NEW.format(key=key, config=_home_short(config), bind=indented))
+    return 0
 
 
 def admin(bindir: str, argv: list[str]) -> int:
@@ -1657,6 +1971,8 @@ def admin(bindir: str, argv: list[str]) -> int:
     if command == "version":
         print(f"zellij-ai-resume {VERSION}")
         return 0
+    if command == "keybinding":
+        return admin_keybinding(bindir, argv[1:])
     try:
         store = Store()
     except StoreError as error:
@@ -1667,6 +1983,8 @@ def admin(bindir: str, argv: list[str]) -> int:
         return 1
     if command == "list" and len(argv) <= 1:
         return admin_list(store)
+    if command == "reload":
+        return admin_reload(store, argv[1:])
     if command == "doctor" and len(argv) <= 1:
         return admin_doctor(store, bindir)
     if command == "gc":

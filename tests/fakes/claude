@@ -63,7 +63,10 @@ if "--version" in args or "-v" in args:
     sys.exit(0)
 
 signal.signal(signal.SIGHUP, leave)
-signal.signal(signal.SIGTERM, leave)
+if os.environ.get("FAKE_IGNORE_TERM"):  # a CLI that hangs on the way out
+    signal.signal(signal.SIGTERM, lambda signum, frame: log("ignored", signum=signum))
+else:
+    signal.signal(signal.SIGTERM, leave)
 signal.signal(signal.SIGCONT, lambda signum, frame: log("continued"))
 
 session = value("--session-id") or value("--resume", "-r")
@@ -86,6 +89,14 @@ if suspend_after:
     time.sleep(suspend_after)
     log("suspend")
     os.kill(pid, signal.SIGTSTP)
+run_after = float(os.environ.get("FAKE_RUN_AFTER") or 0)
+if run_after and "--resume" not in args:  # first launch only, or a reload would loop
+    # Like `! some command` typed into Claude Code: a child with the CLI's environment.
+    # The command may well end this CLI (zjr reload does), so do not wait for it.
+    time.sleep(run_after)
+    with open(os.environ["FAKE_RUN_OUTPUT"], "w") as output:
+        subprocess.Popen(os.environ["FAKE_RUN"].split(), stdout=output, stderr=subprocess.STDOUT)
+    log("ran")
 if clear_after:
     time.sleep(clear_after)
     session = str(uuid.uuid4())

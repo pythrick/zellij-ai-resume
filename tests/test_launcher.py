@@ -176,6 +176,98 @@ class ClaudeLauncher(LauncherTest):
         self.assertIn("starting without recovery", pane.text())
 
 
+class Reload(LauncherTest):
+    tool = "zclaude"
+
+    def zjr(self, *args, **extra):
+        env = dict(self.box.env, **{key: str(value) for key, value in extra.items()})
+        return subprocess.run([self.box.launcher("zjr"), *args], env=env, capture_output=True, text=True, timeout=60)
+
+    def test_reload_restarts_the_cli_on_its_current_conversation(self):
+        pane = self.box.pane([self.box.launcher("zclaude"), "--verbose", "a prompt"], FAKE_CLEAR_AFTER=1)
+        command = self.saved_command(pane)
+        token = command[3]
+        first = self.box.wait_event(event="start")
+        cleared = self.box.wait_event(event="clear")["session"]
+        wait_for(lambda: self.state(token)["session_id"] == cleared, what="state to follow /clear")
+        done = self.zjr("reload", token[:8])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"reloaded claude pane {token[:8]} on conversation {cleared}", done.stdout)
+        self.assertEqual(self.box.wait_event(event="signal")["signum"], signal.SIGTERM)
+        again = self.box.wait_event(event="start", skip=1)
+        self.assertEqual(again["argv"], ["--resume", cleared, "--verbose"])
+        self.assertNotEqual(again["pid"], first["pid"])
+        self.assertEqual(pane.command_line().split(), command)  # same pane process, same saved command
+        self.assertEqual(self.state(token)["runs"], 2)
+        self.assertIn("\x1b[H\x1b[2J", pane.text())  # the screen was reset between the two
+        self.assertIsNone(self.state(token)["failed_resume"])
+
+    def test_reload_from_inside_the_cli(self):
+        output = os.path.join(self.box.dir, "ran.txt")
+        pane = self.box.pane([self.box.launcher("zclaude"), "--verbose"], FAKE_RUN_AFTER=1, FAKE_RUN="zjr reload",
+                             FAKE_RUN_OUTPUT=output)
+        token = self.saved_command(pane)[3]
+        first = self.box.wait_event(event="start")
+        again = self.box.wait_event(event="start", skip=1)
+        self.assertEqual(again["argv"], ["--resume", first["session"], "--verbose"])
+        wait_for(lambda: open(output).read().strip(), what="zjr reload output")
+        self.assertEqual(open(output).read().strip(), f"reloading claude pane {token[:8]}")
+
+    def test_a_cli_that_ignores_sigterm_is_killed_after_the_grace_period(self):
+        pane = self.box.pane([self.box.launcher("zclaude")], FAKE_IGNORE_TERM=1)
+        token = self.saved_command(pane)[3]
+        first = self.box.wait_event(event="start")
+        began = time.monotonic()
+        self.assertEqual(self.zjr("reload", token).returncode, 0)
+        self.box.wait_event(event="ignored")
+        again = self.box.wait_event(event="start", skip=1, timeout=15)
+        self.assertGreaterEqual(time.monotonic() - began, 4.5)
+        self.assertEqual(again["argv"][:2], ["--resume", first["session"]])
+
+    def test_closing_the_pane_during_a_reload_does_not_relaunch(self):
+        pane = self.box.pane([self.box.launcher("zclaude")], FAKE_IGNORE_TERM=1)
+        token = self.saved_command(pane)[3]
+        self.box.wait_event(event="start")
+        reload = subprocess.Popen([self.box.launcher("zjr"), "reload", token], env=self.box.env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.box.wait_event(event="ignored")
+        pane.signal_group(signal.SIGHUP)
+        pane.wait()
+        reload.wait(timeout=30)
+        time.sleep(1)
+        self.assertEqual(len(self.box.events(event="start")), 1)
+        self.assertIsNone(self.state(token)["core_pid"])
+
+    def test_reload_requests_in_quick_succession_are_safe(self):
+        pane = self.box.pane([self.box.launcher("zclaude")])
+        token = self.saved_command(pane)[3]
+        self.box.wait_event(event="start")
+        core = self.state(token)["core_pid"]
+        for _ in range(5):
+            os.kill(core, signal.SIGUSR1)
+            time.sleep(0.05)
+        wait_for(lambda: len(self.box.events(event="start")) >= 2, what="a restart")
+        time.sleep(2)
+        self.assertIsNone(pane.proc.poll())  # the pane is still running
+        self.assertEqual(self.state(token)["core_pid"], core)
+        self.assertEqual(self.zjr("reload", token).returncode, 0)
+
+    def test_nothing_to_reload(self):
+        done = self.zjr("reload")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("not inside Zellij", done.stderr)
+
+    def test_codex_reload(self):
+        self.tool = "zcodex"
+        pane = self.box.pane([self.box.launcher("zcodex"), "-m", "o3"])
+        token = self.saved_command(pane)[3]
+        session = self.box.wait_event(event="rollout")["session"]
+        wait_for(lambda: self.state(token)["session_id"] == session, timeout=8, what="codex session")
+        self.assertEqual(self.zjr("reload", token).returncode, 0)
+        again = self.box.wait_event(event="start", skip=1)
+        self.assertEqual(again["argv"], ["resume", "-m", "o3", session])
+
+
 class CodexLauncher(LauncherTest):
     tool = "zcodex"
 

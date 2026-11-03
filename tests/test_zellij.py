@@ -13,6 +13,7 @@ ZELLIJ_CONFIG_DIR.) Panes run bash without rc files and the fake CLIs, never
 the real claude or codex."""
 
 import glob
+import json
 import os
 import re
 import shutil
@@ -146,6 +147,48 @@ class Resurrection(unittest.TestCase):
         again = self.box.wait_event(event="start", skip=2, timeout=15)
         self.assertEqual(again["argv"], ["--resume", cleared, "--dangerously-skip-permissions"])
 
+
+    def test_keybinding_reloads_the_focused_pane(self):
+        snippet = subprocess.run([self.box.launcher("zjr"), "keybinding"], env=self.env, capture_output=True,
+                                 text=True, check=True).stdout
+        with open(self.config, "a") as handle:
+            handle.write(snippet + "\n")  # what `zjr keybinding` tells you to add, as is
+        self.env["FAKE_CLEAR_AFTER"] = ""
+        launcher = self.box.launcher("zclaude")
+        client = Pane([ZELLIJ, "--config", self.config, "attach", "--create", self.session], self.env, self.box.work)
+        self.clients.append(client)
+
+        def keys(data, pause=1.0):
+            os.write(client.master, data)
+            time.sleep(pause)
+
+        time.sleep(3)
+        keys(f"{launcher} --verbose\r".encode())
+        left = self.box.wait_event(event="start", timeout=15)
+        keys(b"\x1bn", 1.5)  # Alt n: a new pane, which takes the focus
+        keys(f"{launcher} --model x\r".encode())
+        right = self.box.wait_event(event="start", skip=1, timeout=15)
+        wait_for(lambda: len([s for s in self.box.states().values() if s.get("core_pid")]) == 2, what="two running panes")
+
+        def no_floating_pane():
+            panes = json.loads(self.action("list-panes", "--json", "--all"))
+            return not [p for p in panes if p.get("is_floating") and not p.get("is_plugin")]
+
+        keys(b"\x1br", 0)  # Alt r: reload the focused (right) pane
+        again = self.box.wait_event(event="start", skip=2, timeout=20)
+        self.assertEqual(again["argv"], ["--resume", right["session"], "--model", "x"])
+        self.assertEqual([e["pid"] for e in self.box.events(event="signal")], [right["pid"]])
+        wait_for(no_floating_pane, timeout=3, what="the reload pane to close")
+
+        keys(b"\x1bh", 1.5)  # Alt h: focus the left pane
+        keys(b"\x1br", 0)
+        again = self.box.wait_event(event="start", skip=3, timeout=20)
+        self.assertEqual(again["argv"], ["--resume", left["session"], "--verbose"])
+        self.assertEqual(sorted(e["pid"] for e in self.box.events(event="signal")), sorted([right["pid"], left["pid"]]))
+
+        wait_for(no_floating_pane, timeout=3, what="the reload pane to close")
+        layout = self.action("dump-layout")
+        self.assertEqual(len(re.findall(r'args "%s" "--zj-pane"' % re.escape(launcher), layout)), 2)
 
 if __name__ == "__main__":
     unittest.main()

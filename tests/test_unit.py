@@ -454,5 +454,119 @@ class Misc(TempDirTest):
         self.assertEqual((plan.mode, plan.args), ("fresh", ["resume", "-m", "o3"]))
 
 
+class Reload(TempDirTest):
+    def running(self, *entries):
+        """entries: (token, pane_id, zellij_session) of panes whose CLI runs."""
+        return [(token, dict(self.state("claude", [], launched=True), pane_id=pane, zellij_session=session,
+                             core_pid=1000 + index)) for index, (token, pane, session) in enumerate(entries)]
+
+    def target(self, running, panes, env, name=None):
+        store = zjr.Store()
+        with mock.patch.object(zjr, "running_panes", return_value=running), \
+                mock.patch.object(zjr, "zellij_panes", return_value=panes), \
+                mock.patch.dict(os.environ, env, clear=False):
+            for key in ("ZJR_PANE", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
+                if key not in env:
+                    os.environ.pop(key, None)
+            result = zjr.reload_target(store, name)
+        return result if isinstance(result, str) else result[0]
+
+    def layout(self, *panes):
+        """panes: (id, tab, focused, floating)."""
+        return {str(i): {"id": i, "tab_id": tab, "is_focused": focused, "is_floating": floating, "is_plugin": False}
+                for i, tab, focused, floating in panes}
+
+    def test_inside_the_cli_reloads_its_own_pane(self):
+        a, b = str(uuid.uuid4()), str(uuid.uuid4())
+        running = self.running((a, "1", "s"), (b, "2", "s"))
+        self.assertEqual(self.target(running, None, {"ZJR_PANE": b}), b)
+        self.assertIn("not running", self.target(running, None, {"ZJR_PANE": str(uuid.uuid4())}))
+
+    def test_keybinding_targets_the_pane_under_the_floating_pane(self):
+        a, b = str(uuid.uuid4()), str(uuid.uuid4())
+        running = self.running((a, "1", "s"), (b, "2", "s"))
+        panes = self.layout((1, 0, False, False), (2, 0, True, False), (9, 0, True, True))  # 9: the keybinding's pane
+        self.assertEqual(self.target(running, panes, {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}), b)
+
+    def test_single_pane_in_the_tab_and_ambiguity(self):
+        a, b, c = (str(uuid.uuid4()) for _ in range(3))
+        env = {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}
+        one = self.running((a, "1", "s"), (b, "2", "s"))
+        panes = self.layout((1, 0, False, False), (2, 1, True, False), (5, 0, True, False), (9, 0, True, True))
+        self.assertEqual(self.target(one, panes, env), a)  # the only one in this tab, though not focused
+        two = self.running((a, "1", "s"), (c, "3", "s"))
+        panes = self.layout((1, 0, False, False), (3, 0, False, False), (5, 0, True, False), (9, 0, True, True))
+        self.assertIn("several", self.target(two, panes, env))
+        other_tab = self.running((b, "2", "s"))
+        self.assertIn("in this tab", self.target(other_tab, self.layout((2, 1, True, False), (9, 0, True, True)), env))
+
+    def test_other_zellij_sessions_are_never_targeted(self):
+        a = str(uuid.uuid4())
+        running = self.running((a, "1", "other"))
+        env = {"ZELLIJ_SESSION_NAME": "s", "ZELLIJ_PANE_ID": "9"}
+        self.assertIn("no zclaude/zcodex pane", self.target(running, self.layout((1, 0, True, False)), env))
+
+    def test_by_name(self):
+        a, b = "abcdef01-2345-4678-9abc-def012345678", str(uuid.uuid4())
+        running = self.running((a, "1", "s"), (b, "2", "s"))
+        self.assertEqual(self.target(running, None, {}, name="abcdef"), a)
+        self.assertIn("0 running panes", self.target(running, None, {}, name="ffff"))
+
+    def test_core_pid_is_checked_against_the_process(self):
+        token = str(uuid.uuid4())
+        self.assertFalse(zjr._is_core(os.getpid(), token))  # a live pid that is not this pane's core
+
+    def test_new_state_fields_are_validated(self):
+        good = self.state("claude", [])
+        for field, value in (("core_pid", True), ("core_pid", -1), ("runs", "2"), ("pane_id", "terminal_1"),
+                             ("pane_id", "1; rm")):
+            self.assertIsNone(zjr.validate_state(dict(good, **{field: value}), "claude"), (field, value))
+        self.assertIsNotNone(zjr.validate_state(dict(good, core_pid=123, runs=4, pane_id="12"), "claude"))
+
+    def test_own_conversation_lock_is_not_someone_elses(self):
+        store = zjr.Store()
+        pane = zjr.Pane(store, str(uuid.uuid4()), self.state("claude", []), CLAUDE, True)
+        self.assertTrue(pane.lock_session(U1))
+        self.assertFalse(pane.claimed_elsewhere(U1))
+        other = zjr.Pane(store, str(uuid.uuid4()), self.state("claude", []), CLAUDE, True)
+        self.assertTrue(other.claimed_elsewhere(U1))
+        pane.release()
+
+
+class KeybindingConfig(TempDirTest):
+    def config(self, text):
+        path = os.path.join(self.dir, "config.kdl")
+        with open(path, "w") as handle:
+            handle.write(text)
+        return path
+
+    def run_admin(self, *argv, config=None):
+        import contextlib, io
+        out = io.StringIO()
+        env = {"ZELLIJ_CONFIG_FILE": config or "", "ZELLIJ_CONFIG_DIR": self.dir, "HOME": self.dir}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
+            code = zjr.admin("/opt/x/bin", list(argv))
+        return code, out.getvalue()
+
+    BIND = 'bind "Alt r" { Run "/opt/x/bin/zjr" "reload" "--from-keybinding" { floating true; close_on_exit true; }; }'
+
+    def test_snippet_matches_the_config(self):
+        code, text = self.run_admin("keybinding", config=self.config('keybinds clear-defaults=true {\n}\n'))
+        self.assertEqual(code, 0)
+        self.assertIn("Zellij ignores a", text)
+        self.assertNotIn("keybinds {", text)
+        code, text = self.run_admin("keybinding", "Ctrl", "Alt", "r", config=self.config("// keybinds {\n"))
+        self.assertIn('keybinds {\n    shared_except "locked" {\n        bind "Ctrl Alt r"', text)
+        self.assertIn('Run "/opt/x/bin/zjr" "reload" "--from-keybinding"', text)
+        self.assertEqual(self.run_admin("keybinding", 'r" { Quit; } bind "x')[0], 2)
+
+    def test_doctor_spots_a_binding_zellij_ignores(self):
+        ignored = self.config("keybinds {\n    normal {\n    }\n}\nkeybinds {\n    shared_except \"locked\" {\n        "
+                              + self.BIND + "\n    }\n}\n")
+        self.assertIn("second `keybinds` block", self.run_admin("doctor", config=ignored)[1])
+        honoured = self.config("keybinds {\n    shared_except \"locked\" {\n        " + self.BIND + "\n    }\n}\n")
+        self.assertIn("Alt r reloads the focused pane", self.run_admin("doctor", config=honoured)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

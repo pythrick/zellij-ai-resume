@@ -20,6 +20,30 @@ zellij attach my-session                   # then Enter in each pane
 Outside Zellij, and for anything non-interactive (`-p`, `--version`, `mcp`,
 `codex exec`, ...), `zclaude` and `zcodex` are exactly `claude` and `codex`.
 
+## Reload
+
+Restart a pane's CLI in place, on the conversation it is on (after a
+`/clear` or `/resume` too), with the options it was started with: to pick up
+a new Claude Code or Codex version, new MCP servers, a changed setting.
+
+- Inside Claude Code: `! zjr reload`.
+- From any other pane: `zjr reload` reloads the focused zclaude/zcodex pane of
+  that tab (or the only one there); `zjr reload PANE` names one from `zjr list`.
+- With a key: `zjr keybinding` prints a Zellij binding for `Alt r` (or
+  `zjr keybinding "Ctrl Alt r"`, ...) to paste into your Zellij config. Nothing
+  is written for you. If your config already has a `keybinds` block, put the
+  `bind` inside it: Zellij silently ignores a second `keybinds` block, and
+  `zjr doctor` points it out.
+
+The CLI gets SIGTERM (and SIGKILL if it is still running 5 seconds later).
+Claude Code exits cleanly on it; Codex exits at once and leaves its terminal
+modes on, so the launcher resets the terminal (it does that whenever a CLI
+dies from a signal). The CLI then starts again in the same pane process, so the pane's saved command, and with
+it recovery, is unchanged. There is no key interception: the binding runs
+`zjr reload` in a floating pane that closes at once, and the CLI keeps the
+terminal to itself the whole time. Closing a pane during a reload closes it;
+it never comes back.
+
 ## What it changes on your system
 
 | Path | What |
@@ -123,6 +147,8 @@ The pane prints which words were left out.
   uuid4 strings and conversation ids UUIDs before they reach a path or a
   command line.
 - Resurrection keeps Zellij's own gate: nothing runs until you press Enter.
+- `zjr reload` signals only a pane's own core, after checking that the pid in
+  the pane's state file is a running `zjr.py` for that pane (not a reused pid).
 - `events.log` records ids, directories and exit codes, never prompts.
 - If anything in the launcher's own machinery fails, it says so and runs the
   plain CLI instead of standing in your way. A `claude` on PATH that is really
@@ -135,6 +161,8 @@ The pane prints which words were left out.
 
 ```
 zjr list              panes that can be restored, and the conversation of each
+zjr reload [PANE]     restart a pane's CLI on its current conversation
+zjr keybinding [KEY]  print a Zellij binding for reload (default Alt r)
 zjr doctor            check the installation, PATH, Zellij config, CLIs
 zjr gc [--days N]     forget panes untouched for N days (default 30)
 zjr forget PANE       forget one pane
@@ -157,7 +185,7 @@ zjr forget PANE       forget one pane
 ```sh
 cd tests
 python3 -m unittest test_unit test_launcher          # about a minute
-ZJR_E2E=1 python3 -m unittest test_zellij            # real Zellij: crash, resurrect, Enter, twice
+ZJR_E2E=1 python3 -m unittest test_zellij            # real Zellij: crash/resurrect twice; Alt r reload
 tests/run-linux.sh                                   # all of it on Arch Linux ARM, bash and dash as /bin/sh
 ```
 
