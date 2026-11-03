@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""A stand-in for Claude Code: logs its argv, keeps a session registry entry
+and a transcript the way Claude Code does, and can simulate /clear."""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+LOG = os.environ["FAKE_LOG"]
+CONFIG = os.environ["CLAUDE_CONFIG_DIR"]
+args = sys.argv[1:]
+pid = os.getpid()
+registry = os.path.join(CONFIG, "sessions", f"{pid}.json")
+
+
+def log(event, **fields):
+    with open(LOG, "a") as handle:
+        handle.write(json.dumps({"tool": "claude", "event": event, "pid": pid, **fields}) + "\n")
+
+
+def value(*names):
+    for index, word in enumerate(args):
+        if word in names and index + 1 < len(args):
+            return args[index + 1]
+    return None
+
+
+def register(session):
+    # Like Claude Code: procStart is the process start in UTC, C locale; startedAt is epoch ms.
+    os.makedirs(os.path.dirname(registry), exist_ok=True)
+    env = dict(os.environ, LC_ALL="C", TZ="UTC0")
+    started = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env=env).stdout
+    entry = {"pid": pid, "sessionId": session, "cwd": os.getcwd(), "procStart": " ".join(started.split()),
+             "startedAt": int(time.time() * 1000)}
+    with open(registry + ".tmp", "w") as handle:
+        json.dump(entry, handle)
+    os.replace(registry + ".tmp", registry)
+
+
+def transcript(session):
+    project = os.path.join(CONFIG, "projects", os.getcwd().replace("/", "-"))
+    os.makedirs(project, exist_ok=True)
+    with open(os.path.join(project, session + ".jsonl"), "a") as handle:
+        handle.write(json.dumps({"sessionId": session}) + "\n")
+
+
+def leave(signum, frame):
+    log("signal", signum=signum)
+    try:
+        os.unlink(registry)
+    except OSError:
+        pass
+    sys.exit(128 + signum)
+
+
+if "--version" in args or "-v" in args:
+    print("9.9.9 (Fake Claude)")
+    log("version", argv=args)
+    sys.exit(0)
+
+signal.signal(signal.SIGHUP, leave)
+signal.signal(signal.SIGTERM, leave)
+signal.signal(signal.SIGCONT, lambda signum, frame: log("continued"))
+
+session = value("--session-id") or value("--resume", "-r")
+if os.environ.get("FAKE_RESUME_FAIL") and "--resume" in args and "--fork-session" not in args:
+    log("start", argv=args, cwd=os.getcwd(), session=session, failed=True)
+    print(f"No conversation found with session ID: {session}", file=sys.stderr)
+    sys.exit(1)
+if session is None or "--fork-session" in args:
+    session = str(uuid.uuid4())
+register(session)
+transcript(session)
+log("start", argv=args, cwd=os.getcwd(), session=session)
+
+began = time.monotonic()
+clear_after = float(os.environ.get("FAKE_CLEAR_AFTER") or 0)
+exit_after = float(os.environ.get("FAKE_EXIT_AFTER") or 0)
+suspend_after = float(os.environ.get("FAKE_SUSPEND_AFTER") or 0)
+if suspend_after:
+    # What a TUI does for Ctrl+Z while the terminal is in raw mode: stop itself.
+    time.sleep(suspend_after)
+    log("suspend")
+    os.kill(pid, signal.SIGTSTP)
+if clear_after:
+    time.sleep(clear_after)
+    session = str(uuid.uuid4())
+    register(session)
+    transcript(session)
+    log("clear", session=session)
+while not exit_after or time.monotonic() - began < exit_after:
+    time.sleep(0.05)
+os.unlink(registry)
+log("exit")
+sys.exit(int(os.environ.get("FAKE_EXIT_CODE") or 0))

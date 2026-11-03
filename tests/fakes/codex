@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""A stand-in for Codex: logs its argv and writes rollout files laid out
+like Codex's ($CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl).
+Like Codex running in-process it keeps the current rollout open;
+FAKE_DAEMON=1 behaves like the shared daemon writing it instead."""
+
+import datetime
+import glob
+import json
+import os
+import re
+import signal
+import sys
+import time
+import uuid
+
+LOG = os.environ["FAKE_LOG"]
+HOME = os.environ["CODEX_HOME"]
+args = sys.argv[1:]
+pid = os.getpid()
+held = None
+UUID = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+
+def log(event, **fields):
+    with open(LOG, "a") as handle:
+        handle.write(json.dumps({"tool": "codex", "event": event, "pid": pid, **fields}) + "\n")
+
+
+def workdir():
+    for index, word in enumerate(args):
+        if word in ("-C", "--cd") and index + 1 < len(args):
+            return os.path.realpath(os.path.join(os.getcwd(), args[index + 1]))
+    return os.getcwd()
+
+
+def new_rollout():
+    session = str(uuid.uuid4())
+    now = datetime.datetime.now()
+    day = os.path.join(HOME, "sessions", f"{now:%Y}", f"{now:%m}", f"{now:%d}")
+    os.makedirs(day, exist_ok=True)
+    meta = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "type": "session_meta",
+        "payload": {
+            "id": session,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123Z"),
+            "cwd": workdir(),
+            "originator": "codex-tui",
+            "source": "cli",
+            "base_instructions": {"text": "x" * 30000},
+        },
+    }
+    global held
+    handle = open(os.path.join(day, f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{session}.jsonl"), "w")
+    handle.write(json.dumps(meta) + "\n")
+    handle.flush()
+    if os.environ.get("FAKE_DAEMON"):
+        handle.close()
+    else:
+        held = handle  # replaces (and so closes) the previous one
+    return session
+
+
+def leave(signum, frame):
+    log("signal", signum=signum)
+    sys.exit(128 + signum)
+
+
+if "--version" in args or "-V" in args:
+    print("codex-cli 9.9.9")
+    log("version", argv=args)
+    sys.exit(0)
+
+signal.signal(signal.SIGHUP, leave)
+signal.signal(signal.SIGTERM, leave)
+
+session = None
+if args and args[0] == "resume" and UUID.match(args[-1]):
+    session = args[-1]
+    for path in glob.glob(os.path.join(HOME, "sessions", "*", "*", "*", f"rollout-*-{session}.jsonl")):
+        held = open(path, "a")
+        held.write(json.dumps({"type": "resumed"}) + "\n")
+        held.flush()
+log("start", argv=args, cwd=os.getcwd(), session=session)
+if session is None:
+    time.sleep(float(os.environ.get("FAKE_ROLLOUT_DELAY") or 0))
+    session = new_rollout()
+    log("rollout", session=session)
+
+began = time.monotonic()
+new_after = float(os.environ.get("FAKE_NEW_AFTER") or 0)
+exit_after = float(os.environ.get("FAKE_EXIT_AFTER") or 0)
+if new_after:
+    time.sleep(new_after)
+    session = new_rollout()
+    log("new", session=session)
+while not exit_after or time.monotonic() - began < exit_after:
+    time.sleep(0.05)
+log("exit")
+sys.exit(int(os.environ.get("FAKE_EXIT_CODE") or 0))
