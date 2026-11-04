@@ -39,10 +39,12 @@ const PIPE_NAME: &str = "zjr-reload";
 /// Marks the commands that enter their directory themselves (see `command_in`).
 const MARKER: &str = "zellij-ai-resume";
 
-/// One host command per tick: the process table, Claude Code's registry, the
-/// files the given process trees hold open, and recent Codex rollouts.
+/// One host command per tick: the process table (with process groups, to
+/// tell a shell's foreground job from its background ones), Claude Code's
+/// registry, the files the given process trees hold open, and recent Codex
+/// rollouts.
 const PROBE: &str = r#"
-table=$(ps -A -o pid=,ppid=)
+table=$(ps -A -o pid=,ppid=,pgid=,tpgid=)
 printf '%s\n' "$table"
 echo '--claude--'
 for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/sessions/*.json; do
@@ -266,7 +268,14 @@ impl ZellijPlugin for State {
         let Some(payload) = message.payload.as_deref().map(str::trim).filter(|payload| !payload.is_empty()) else {
             return false;
         };
-        self.reload(payload.parse::<u32>().ok());
+        // `reload` for the focused pane, or a pane id: 3 or terminal_3.
+        if payload == "reload" {
+            self.reload(None);
+        } else if let Ok(pane) = payload.strip_prefix("terminal_").unwrap_or(payload).parse::<u32>() {
+            self.reload(Some(pane));
+        } else {
+            self.note(format!("{PIPE_NAME}: {payload:?} is neither `reload` nor a pane id"));
+        }
         true
     }
 
@@ -473,10 +482,16 @@ impl State {
     fn on_probe(&mut self, output: &str) {
         let sections = split_sections(output);
         let mut parent: HashMap<i32, i32> = HashMap::new();
+        let mut foreground: HashSet<i32> = HashSet::new();
         for line in sections.get("").map(String::as_str).unwrap_or("").lines() {
-            let mut fields = line.split_whitespace();
-            if let (Some(Ok(pid)), Some(Ok(ppid))) = (fields.next().map(str::parse), fields.next().map(str::parse)) {
+            let fields: Vec<i32> = line.split_whitespace().map_while(|field| field.parse().ok()).collect();
+            if let [pid, ppid, ref rest @ ..] = fields[..] {
                 parent.insert(pid, ppid);
+                if let [pgid, tpgid] = rest[..] {
+                    if pgid > 0 && pgid == tpgid {
+                        foreground.insert(pid); // in its terminal's foreground job
+                    }
+                }
             }
         }
         let registry: Vec<Value> = serde_json::Deserializer::from_str(sections.get("claude").map(String::as_str).unwrap_or(""))
@@ -492,12 +507,18 @@ impl State {
         for running in std::mem::take(&mut self.probing) {
             let previous = self.live.get(&running.pane).filter(|known| known.running.tool == running.tool);
             let first_seen = previous.map_or(now, |known| known.first_seen);
-            // The CLI's processes: the pane's own process for a command pane,
-            // its descendants otherwise (the shell is not the CLI).
-            let mut pids: Vec<i32> = parent.keys().copied().filter(|pid| descends_from(*pid, running.pane_pid, &parent)).collect();
-            if !running.command_pane {
-                pids.retain(|pid| *pid != running.pane_pid);
-            }
+            // The CLI's processes: the pane's own process and its tree for a
+            // command pane; for a shell, the tree of its foreground job (not
+            // the shell, nor jobs left in the background).
+            let roots: Vec<i32> = if running.command_pane {
+                vec![running.pane_pid]
+            } else {
+                let children: Vec<i32> = parent.iter().filter(|(_, ppid)| **ppid == running.pane_pid).map(|(pid, _)| *pid).collect();
+                let jobs: Vec<i32> = children.iter().copied().filter(|pid| foreground.contains(pid)).collect();
+                if jobs.is_empty() { children } else { jobs }
+            };
+            let mut pids: Vec<i32> = parent.keys().copied().filter(|pid| roots.iter().any(|root| descends_from(*pid, *root, &parent))).collect();
+            pids.sort_unstable();
             let mut running = running;
             let (session_id, exact) = match running.tool {
                 Tool::Claude => {
@@ -517,12 +538,9 @@ impl State {
                 }
                 Tool::Codex => {
                     // The CLI is the pane's process (a restored pane) or the
-                    // shell's child; its own directory, as -C is relative to it.
-                    let cli = if running.command_pane {
-                        Some(running.pane_pid)
-                    } else {
-                        pids.iter().copied().filter(|pid| parent.get(pid) == Some(&running.pane_pid)).max()
-                    };
+                    // shell's foreground job; its own directory, as -C is
+                    // relative to it.
+                    let cli = roots.iter().copied().max();
                     if let Some(cwd) = cli.and_then(|pid| open.cwd.get(&pid)) {
                         if cwd.starts_with('/') {
                             running.cwd = cwd.clone();
