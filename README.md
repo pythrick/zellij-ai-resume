@@ -90,6 +90,10 @@ itself or jobs you left running in the background.
 Claude Code exits cleanly on SIGTERM. Codex exits at once and leaves its
 terminal modes on, so they are reset before it starts again.
 
+It starts again on the conversation it was on. Claude Code writes a
+conversation only with its first message, so one that has none yet starts
+afresh, with the same options.
+
 How it starts again depends on the pane:
 - In a pane where you started the CLI from your shell, the command is typed
   at the shell's prompt, so it lands in your shell history. It is preceded

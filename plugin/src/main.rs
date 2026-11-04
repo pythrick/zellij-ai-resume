@@ -167,6 +167,7 @@ struct State {
     probe_sent: Option<Instant>,
     check_sent: Option<Instant>,
     reloads: Vec<Reload>,
+    reload_checks: HashMap<u32, Live>, // reloads waiting to learn whether their conversation is on disk
     written: Option<String>,
     bound: bool,
     notes: Vec<String>,
@@ -244,6 +245,11 @@ impl ZellijPlugin for State {
                     Some("check") => {
                         self.check_sent = None;
                         self.on_check(&output);
+                    }
+                    Some("reload") => {
+                        if let Some(pane) = context.get("pane").and_then(|pane| pane.parse().ok()) {
+                            self.on_reload_check(pane, &output);
+                        }
                     }
                     _ => {}
                 }
@@ -641,13 +647,38 @@ impl State {
             self.note("reload: no focused terminal pane".to_string());
             return;
         };
-        if self.reloads.iter().any(|reload| reload.pane == pane) {
+        if self.reloads.iter().any(|reload| reload.pane == pane) || self.reload_checks.contains_key(&pane) {
             return;
         }
         let Some(live) = self.live.get(&pane).cloned() else {
             self.note(format!("reload: pane {pane} runs no tracked CLI"));
             return;
         };
+        // Claude Code names its conversation at start but writes it only with
+        // the first message: resume it only if it is on disk.
+        let Some(id) = live.session_id.clone() else {
+            return self.begin_reload(pane, live);
+        };
+        let mut command = vec!["/bin/sh".to_string(), "-c".to_string(), CHECK.to_string(), "check".to_string()];
+        command.push(format!("{}:{id}", live.running.tool.name()));
+        let mut context = BTreeMap::new();
+        context.insert("kind".to_string(), "reload".to_string());
+        context.insert("pane".to_string(), pane.to_string());
+        let words: Vec<&str> = command.iter().map(String::as_str).collect();
+        run_command(&words, context);
+        self.reload_checks.insert(pane, live);
+    }
+
+    fn on_reload_check(&mut self, pane: u32, output: &str) {
+        let Some(mut live) = self.reload_checks.remove(&pane) else { return };
+        let item = live.session_id.as_ref().map(|id| format!("{}:{id}", live.running.tool.name()));
+        if !output.lines().any(|line| Some(line) == item.as_deref()) {
+            live.session_id = None; // no message yet: a new conversation, with the same options
+        }
+        self.begin_reload(pane, live);
+    }
+
+    fn begin_reload(&mut self, pane: u32, live: Live) {
         signal(&live.pids, "TERM");
         self.reloads.push(Reload { pane, live, began: Instant::now(), killed: false });
         set_timeout(FAST_TICK);

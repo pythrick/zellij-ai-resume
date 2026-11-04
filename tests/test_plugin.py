@@ -289,6 +289,17 @@ class Reload(PluginTest):
         os.write(client.master, b"\x1bn")  # Alt n: the plugin's binding left the others alone
         wait_for(lambda: len(self.terminals()) == 2, interval=0.5, what="Alt n to open a pane")
 
+    def test_reload_before_the_first_message_starts_afresh(self):
+        # Claude Code names the conversation at start but writes it only with
+        # the first message: there is nothing to resume yet.
+        client = self.start(FAKE_NO_TRANSCRIPT=1)
+        self.type(self.terminals()[0]["id"], "claude --verbose 'a prompt'")
+        self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
+        os.write(client.master, b"\x1br")  # Alt r
+        again = self.box.wait_event(event="start", skip=1, timeout=15)
+        self.assertEqual(again["argv"], ["--verbose"])
+        self.assertNotIn("failed", again)
+
     def test_a_configured_reload_key(self):
         config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
         with open(config) as handle:

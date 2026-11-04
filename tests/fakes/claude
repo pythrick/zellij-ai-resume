@@ -41,10 +41,13 @@ def register(session):
     os.replace(registry + ".tmp", registry)
 
 
+def transcript_path(session):
+    return os.path.join(CONFIG, "projects", os.getcwd().replace("/", "-"), session + ".jsonl")
+
+
 def transcript(session):
-    project = os.path.join(CONFIG, "projects", os.getcwd().replace("/", "-"))
-    os.makedirs(project, exist_ok=True)
-    with open(os.path.join(project, session + ".jsonl"), "a") as handle:
+    os.makedirs(os.path.dirname(transcript_path(session)), exist_ok=True)
+    with open(transcript_path(session), "a") as handle:
         handle.write(json.dumps({"sessionId": session}) + "\n")
 
 
@@ -70,14 +73,17 @@ else:
 signal.signal(signal.SIGCONT, lambda signum, frame: log("continued"))
 
 session = value("--session-id") or value("--resume", "-r")
-if os.environ.get("FAKE_RESUME_FAIL") and "--resume" in args and "--fork-session" not in args:
+# Like Claude Code: --resume looks in the current directory's project only.
+missing = "--resume" in args and not os.path.exists(transcript_path(session))
+if missing or (os.environ.get("FAKE_RESUME_FAIL") and "--resume" in args and "--fork-session" not in args):
     log("start", argv=args, cwd=os.getcwd(), session=session, failed=True)
     print(f"No conversation found with session ID: {session}", file=sys.stderr)
     sys.exit(1)
 if session is None or "--fork-session" in args:
     session = str(uuid.uuid4())
 register(session)
-transcript(session)
+if not os.environ.get("FAKE_NO_TRANSCRIPT"):  # Claude Code writes it with the first message
+    transcript(session)
 log("start", argv=args, cwd=os.getcwd(), session=session)
 
 began = time.monotonic()
