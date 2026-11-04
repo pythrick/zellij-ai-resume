@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/run-linux.sh: run the whole test suite, the real-Zellij ones and the
-# plugin's included, on Arch Linux ARM in an Apple `container` VM (native on
+# tests/run-linux.sh: run the whole test suite, the real-Zellij end-to-end
+# tests included, on Arch Linux ARM in an Apple `container` VM (native on
 # Apple silicon), once with bash and once with dash as /bin/sh. The plugin is
 # built here (a .wasm runs anywhere) and mounted into the VM.
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 
 image=${ZJR_LINUX_IMAGE:-docker.io/menci/archlinuxarm:latest}
 mirror=${ZJR_ALARM_MIRROR:-http://mirror.archlinuxarm.org/aarch64}
-packages="python procps-ng zsh dash zellij"
+packages="python procps-ng dash zellij"
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -52,10 +52,10 @@ status=0
 for sh in bash dash; do
     ln -sf \$sh /usr/bin/sh
     echo "== /bin/sh is \$sh"
-    for file in install.sh uninstall.sh src/launcher.sh.in src/zjr.sh.in; do
+    for file in install.sh uninstall.sh; do
         /bin/sh -n /home/tester/zjr/\$file || status=1
     done
-    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 ZJR_PLUGIN_WASM=/home/tester/zjr/plugin/zellij-ai-resume.wasm python3 -W error::DeprecationWarning -m unittest test_unit test_launcher test_zellij test_plugin' || status=1
+    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 ZJR_PLUGIN_WASM=/home/tester/zjr/plugin/zellij-ai-resume.wasm python3 -W error::DeprecationWarning -m unittest test_install test_plugin' || status=1
 done
 exit \$status
 EOF

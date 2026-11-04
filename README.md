@@ -1,210 +1,247 @@
 # zellij-ai-resume
 
-Per-pane conversation recovery for **Claude Code** and **Codex** in **Zellij**,
-on macOS and Linux, without touching your dotfiles.
+A Zellij plugin that brings **Claude Code** and **Codex** panes back on their
+conversations when a session is resurrected, on macOS and Linux. You keep
+running plain `claude` and `codex`, with no wrapper and no aliases.
 
-When a Zellij session dies (crash, reboot, `kill -9`) Zellij can resurrect it:
-every pane gets its last command back, waiting for Enter. Start the CLIs with
-`zclaude` / `zcodex` instead of `claude` / `codex`, and pressing Enter in a
-resurrected pane resumes the conversation that pane was on, including after a
-`/clear` or `/resume`, with the options you started it with.
+When a Zellij session dies (crash, reboot, `kill -9`), Zellij can resurrect
+it: every pane gets its last command back, waiting for Enter. With the
+plugin loaded, each Claude Code and Codex pane comes back on its own: on the
+conversation that pane was on (after a `/clear` or `/resume` too), in the
+directory it ran in, with the options it was started with. Other panes come
+back as Zellij restores them.
+
+It also adds a reload key: **Alt r** restarts the focused pane's CLI in
+place, on its current conversation. Use it to pick up a new Claude Code or
+Codex version, new MCP servers or a changed setting.
 
 ```sh
-./install.sh            # ~/.local/bin/{zclaude,zcodex,zjr}, nothing else
-zclaude --dangerously-skip-permissions     # any claude arguments
-zcodex -m o3                               # any codex arguments
-# ...Zellij dies...
-zellij attach my-session                   # then Enter in each pane
+./install.sh --edit-config      # builds the plugin, adds it to load_plugins
+# then once, inside Zellij (and press y in the pane that opens):
+zellij plugin -- 'file:~/.config/zellij/plugins/zellij-ai-resume.wasm'
 ```
 
-Outside Zellij, and for anything non-interactive (`-p`, `--version`, `mcp`,
-`codex exec`, ...), `zclaude` and `zcodex` are exactly `claude` and `codex`.
+## Install
 
-## Reload
+Requirements:
+- Zellij 0.45 on macOS or Linux.
+- To build the plugin, Rust through [rustup](https://rustup.rs). The first
+  build fetches the Rust version pinned in `plugin/rust-toolchain.toml`, for
+  `plugin/` only.
 
-Restart a pane's CLI in place, on the conversation it is on (after a
-`/clear` or `/resume` too), with the options it was started with: to pick up
-a new Claude Code or Codex version, new MCP servers, a changed setting.
+`./install.sh` takes these steps:
+1. It builds the plugin, or takes a built one with `--wasm FILE`.
+2. It copies it to `plugins/zellij-ai-resume.wasm` in Zellij's configuration
+   directory, which it asks Zellij for (`zellij setup --check`).
+3. Then it prints what to add to `config.kdl`:
 
-- Inside Claude Code: `! zjr reload`.
-- From any other pane: `zjr reload` reloads the focused zclaude/zcodex pane of
-  that tab (or the only one there); `zjr reload PANE` names one from `zjr list`.
-- With a key: `zjr keybinding` prints a Zellij binding for `Alt r` (or
-  `zjr keybinding "Ctrl Alt r"`, ...) to paste into your Zellij config. Nothing
-  is written for you. If your config already has a `keybinds` block, put the
-  `bind` inside it: Zellij silently ignores a second `keybinds` block, and
-  `zjr doctor` points it out.
+   ```kdl
+   load_plugins {
+       "file:~/.config/zellij/plugins/zellij-ai-resume.wasm"
+   }
+   ```
 
-The CLI gets SIGTERM (and SIGKILL if it is still running 5 seconds later).
-Claude Code exits cleanly on it; Codex exits at once and leaves its terminal
-modes on, so the launcher resets the terminal (it does that whenever a CLI
-dies from a signal). The CLI then starts again in the same pane process, so the pane's saved command, and with
-it recovery, is unchanged. There is no key interception: the binding runs
-`zjr reload` in a floating pane that closes at once, and the CLI keeps the
-terminal to itself the whole time. Closing a pane during a reload closes it;
-it never comes back.
+   Zellij reads only the first `load_plugins` block, so if you already have
+   one, put the line inside it.
 
-## What it changes on your system
+`--edit-config` does that step for you:
+- It fills in an existing `load_plugins { ... }` block, adds one, or creates
+  `config.kdl`.
+- It keeps the file as it was in `config.kdl.before-zellij-ai-resume`.
+- It leaves a symlinked `config.kdl` alone (for managed dotfiles), and any
+  block it cannot edit safely.
+
+Last step: grant the plugin its permissions, once. A plugin loaded in the
+background cannot show Zellij's permission prompt, so open it in a pane:
+run `zellij plugin -- 'file:~/.config/zellij/plugins/zellij-ai-resume.wasm'`
+inside Zellij and press `y`. Zellij remembers the answer for that file. The
+pane shows the plugin's status and can be closed.
+
+Zellij resurrects sessions only if its configuration directory exists.
+Installing creates it, since the plugin lives there.
+
+To upgrade, pull and run `./install.sh` again. Sessions started from then on
+use the new build, and the grant still holds.
+
+To uninstall, run `./uninstall.sh`. It removes the plugin and prints the line
+to delete from `config.kdl`, or deletes it with `--edit-config`. `--purge`
+also deletes the saved pane maps.
 
 | Path | What |
 |---|---|
-| `~/.local/bin/zclaude`, `zcodex`, `zjr` | small `/bin/sh` launchers (generated) |
-| `~/.local/share/zellij-ai-resume/zjr.py` | the core: one Python file, standard library only |
-| `~/.local/state/zellij-ai-resume/` | one 0600 JSON file per pane, one per running pane (for reload), lock files, `events.log` (created on first use, 0700) |
+| `~/.config/zellij/plugins/zellij-ai-resume.wasm` | the plugin (or under your `ZELLIJ_CONFIG_DIR`) |
+| `config.kdl` | one line in `load_plugins`, added by you or by `--edit-config` |
+| Zellij's cache folder | Zellij's own `permissions.kdl` entry, and the plugin's folder with one small JSON map per session (deleted after 30 days unused) |
 
-Nothing else: no shell rc files, no Zellij, Claude Code or Codex configuration,
-no hooks, no background services. `./uninstall.sh` removes it
-(`--purge` also deletes the saved state). `--prefix DIR` installs elsewhere.
+Nothing else changes: no shell rc files, no Claude Code or Codex
+configuration, no hooks, no wrappers on PATH.
 
-Requirements: Zellij (tested with 0.45.1), Python 3.8+, `/bin/sh` (bash or
-dash). Tested on macOS 26 (Apple silicon) and Arch Linux ARM.
+## Reload
 
-Zellij resurrects sessions only if its configuration directory exists
-(`~/.config/zellij`, or `ZELLIJ_CONFIG_DIR`); without it every attach starts
-an empty session. `mkdir -p ~/.config/zellij` is enough, and `zjr doctor`
-checks for it.
+- **Alt r** works in every mode except locked. It reloads the focused pane.
+- **`zellij pipe --name zjr-reload -- reload`** does the same from a script.
+  Inside Claude Code, type `! zellij pipe --name zjr-reload -- reload`.
+- **`zellij pipe --name zjr-reload -- <pane id>`** reloads a given pane. The
+  id can be `3` or `terminal_3`, as `zellij action list-panes` lists them.
 
-### Which Python
+The CLI gets SIGTERM, and SIGKILL if it is still running 5 seconds later.
+In a shell pane that is the foreground job's process tree, not the shell
+itself or jobs you left running in the background.
+Claude Code exits cleanly on SIGTERM. Codex exits at once and leaves its
+terminal modes on, so they are reset before it starts again.
 
-The installer records one interpreter in the launchers: `--python PATH` if
-given, else `/usr/bin/python3` (on macOS only when the Command Line Tools are
-installed, since without them that stub opens an installer dialog), else the
-`python3` on PATH, with a pyenv/mise/asdf shim resolved to the interpreter it
-points at. It warns when that is a virtualenv or a single versioned install
-(uv, mise, Homebrew Cellar), which go away on upgrade. Any CPython 3.8+ works;
-the core is one file using only the standard library.
+How it starts again depends on the pane:
+- In a pane where you started the CLI from your shell, the command is typed
+  at the shell's prompt, so it lands in your shell history. It is preceded
+  by a `cd` if the shell is not in the CLI's directory.
+- A resurrected pane is replaced in place.
 
-The interpreter is never part of what Zellij saves, so upgrading or removing
-it cannot break resurrection: if the recorded one is gone, the launcher uses
-`/usr/bin/python3` or `python3` on PATH, and with no usable Python at all it
-starts the plain CLI with a notice.
+The binding is added to the running session, not written to your
+configuration. To change or drop it, give the plugin a `reload_key`
+(`""` for none):
+
+```kdl
+load_plugins {
+    "file:~/.config/zellij/plugins/zellij-ai-resume.wasm" {
+        reload_key "Ctrl Alt r"
+    }
+}
+```
 
 ## How it works
 
-Zellij saves, for each pane, the command running in its foreground, and on
-resurrection offers to run it again. For a `zclaude` pane that command is
+While a session runs, the plugin runs one small shell script on the host
+every 2 seconds. The script reads:
+- the process table;
+- Claude Code's process registry;
+- for Codex panes, the files the pane's processes hold open (`lsof` on
+  macOS, `/proc` on Linux), and the recent rollout files.
 
-    /bin/sh ~/.local/bin/zclaude --zj-pane <token>
+From that it keeps a map: for each pane running `claude` or `codex`, the
+conversation, the directory and the arguments.
 
-```
-zsh (your pane's shell)
-└─ /bin/sh zclaude --zj-pane <token>    ← what Zellij saves; stays alive
-   └─ python3 -I zjr.py run claude ...  ← tracks the conversation
-      └─ claude --session-id <id> ...   ← in the foreground of your terminal
-```
+- **Claude Code** writes `~/.claude/sessions/<pid>.json`, with the
+  conversation id and directory of each running process. That makes
+  `/clear`, `/resume` and `--continue` exact.
+- **Codex** keeps its rollout file
+  (`~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`) open, which is also
+  exact. Sometimes Codex's shared daemon writes the file instead, and nothing
+  in the pane holds it open. The plugin then guesses: the first rollout
+  started in the pane's directory since the CLI was first seen, that no other
+  pane has claimed. A guess is made once and never replaces a conversation
+  already found. Two daemon-backed Codex sessions started in one directory
+  within seconds of each other can still be swapped.
 
-- The token names a state file holding the arguments you gave and the
-  conversation the pane is on now. Your arguments are not in the saved command,
-  so quoting and spaces survive (Zellij splits saved commands on whitespace).
-- The saved command starts with `/bin/sh` because a Python interpreter's path
-  carries its version and moves on upgrade.
-- A resurrected pane saves the same command again, so it survives any number
-  of crashes. No `post_command_discovery_hook` is needed.
-- The CLI talks to your terminal directly: no pseudo-terminal proxy and no
-  key interception. Ctrl+C, Ctrl+Z / `fg` and resizing behave as with the
-  bare CLI.
+Panes are identified by position: tab, then floating or tiled, top to bottom,
+left to right. A resurrected layout reproduces those positions. The map is
+kept in the plugin's cache folder, which outlives the server. After every
+change the plugin asks Zellij to save the session, so the layout and the map
+always describe the same moment.
 
-**Claude Code** gets `--session-id <uuid>` on first launch, so the conversation
-is known from the start. Claude Code keeps `~/.claude/sessions/<pid>.json` up to
-date with the conversation each process is on; the launcher reads it once a
-second, so `/clear`, `/resume` and `--continue` are followed exactly.
+When a session is resurrected, the plugin looks at the panes Zellij holds
+for Enter. If a pane's position is in the map and the same CLI is waiting
+there, the plugin checks that the conversation still exists. It then replaces
+the pane in place with the command that resumes it, in its directory. For a
+directory Zellij would remap for plugins (`/tmp`, `/data`, `/cache`, `/host`),
+the command enters the directory itself:
+`/bin/sh -c 'cd -- "$1" && shift && exec "$@"' zellij-ai-resume DIR claude ...`.
 
-**Codex** chooses its own id and keeps no such registry. The launcher looks
-for the rollout file (`~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`)
-that the pane's own processes hold open, which is exact and follows `/new`
-and `/resume` inside the pane. When Codex's shared daemon writes the file
-instead, nothing in the pane holds it, and the launcher falls back to a
-guess: the first interactive rollout created after the CLI started, in its
-working directory, that no other `zcodex` pane has claimed. A guess is made
-once, never replaces a conversation already found, and is not made for
-`--worktree` or the `codex resume` picker. Two daemon-backed Codex sessions
-started in one directory within seconds of each other can still be swapped.
-
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_STATE_HOME` are honoured.
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured. When several copies of
+the plugin run in one session (the background one and one opened in a pane),
+the one with the lowest id does the work.
 
 ## What a resumed pane runs
 
 | Situation | Command |
 |---|---|
-| first launch | `claude --session-id <new> <your arguments>` / `codex <your arguments>` |
-| resurrected, conversation on disk | `claude --resume <id> <your options>` / `codex resume <your options> <id>` |
-| the conversation is open in another pane or process | the same with `--fork-session` / `codex fork`: a copy, never two writers |
-| conversation gone (Claude Code deletes transcripts after 30 days), never written, or the resume failed at once | a new conversation with your options, and a note saying why |
+| the conversation is on disk | `claude --resume <id> <your options>` / `codex resume <your options> <id>` |
+| it is open in a live Claude Code process, or another pane resumes it too | the same with `--fork-session` / `codex fork`: a copy, never two writers |
+| it is gone (Claude Code deletes transcripts after 30 days), or never had a message | a new conversation with your options |
 
-"Your options" are the options known to be settings (`--model`,
-`--dangerously-skip-permissions`, `--add-dir`, `-c key=value`, ...). Positional
-prompts, images, `--name`, `--worktree`, `--resume`/`--continue` and options this
-version does not recognise are not repeated, so a crash never re-sends a prompt.
-The pane prints which words were left out.
+"Your options" are the options known to be settings: `--model`,
+`--dangerously-skip-permissions`, `--add-dir`, `-c key=value` and the like.
+The following are never repeated, so a crash never re-sends a prompt:
+- positional prompts and images;
+- `--name`, `--worktree`, `--resume` and `--continue`;
+- options this version does not recognise.
 
 ## Security
 
-- No network access, no `shell=True`, no `eval`; the CLIs are run with argument
-  vectors. The core runs as `python3 -I`, ignoring `PYTHONPATH` and friends.
-- State lives in a 0700 directory that must be a real directory owned by you
-  (symlinks are refused); files are 0600, written atomically, opened with
-  `O_NOFOLLOW`, size-limited and validated field by field. Pane tokens must be
-  uuid4 strings and conversation ids UUIDs before they reach a path or a
-  command line.
-- Resurrection keeps Zellij's own gate: nothing runs until you press Enter.
-- `zjr reload` signals only a pane's own core, after checking that the pid in
-  the pane's state file is a running `zjr.py` for that pane (not a reused pid).
-- `events.log` records ids, directories and exit codes, never prompts.
-- If anything in the launcher's own machinery fails, it says so and runs the
-  plain CLI instead of standing in your way. A `claude` on PATH that is really
-  `zclaude` (a symlink, or a wrapper) is skipped or stopped, never looped.
-- A pane is never resumed into a conversation that another pane, or any live
-  Claude Code process, has open: it continues in a copy (`--fork-session`,
-  `codex fork`) instead, so a transcript never has two writers.
+The plugin asks for six permissions:
 
-## zjr
+| Permission | Used for |
+|---|---|
+| ReadApplicationState | panes, tabs and the session name |
+| RunCommands | the read-only scripts above, and `kill` for reload |
+| WriteToStdin | typing the command at a shell prompt on reload |
+| Reconfigure | binding the reload key for the session |
+| ReadCliPipes | `zellij pipe --name zjr-reload` |
+| ChangeApplicationState | replacing a pane in place, saving the session, waking the background copy after the grant |
 
-```
-zjr list              panes that can be restored, and the conversation of each
-zjr reload [PANE]     restart a pane's CLI on its current conversation
-zjr keybinding [KEY]  print a Zellij binding for reload (default Alt r)
-zjr doctor            check the installation, PATH, Zellij config, CLIs
-zjr gc [--days N]     forget panes untouched for N days (default 30)
-zjr forget PANE       forget one pane
-```
+- **No network access.**
+- **Values never become shell code.** Commands are argument vectors. The
+  scripts are fixed text, and values reach them as arguments, never spliced
+  into the script. The command typed at a shell prompt on reload is quoted
+  word by word.
+- **What is saved is checked before it is used again.**
+  - Conversation ids must be UUIDs before they reach a command line.
+  - The tool must be `claude` or `codex`.
+  - Saved arguments are filtered again through the tables of known options.
+- **Reload signals only the CLI's own processes**: the pane's foreground
+  job and its children, from the same listing.
+- **Unlike Zellij's default, resurrected CLI panes start without Enter.**
+  This applies only to panes whose position and CLI match what the plugin
+  recorded, in the first 20 seconds after the session loads. It runs a
+  command the plugin builds, never the saved command line.
 
 ## Limitations
 
-- Only `zclaude` / `zcodex` started directly from the pane's shell are tracked:
-  in a nested shell or over ssh, Zellij saves the outer program instead.
-- Zellij must keep `session_serialization` on (the default) and have a
-  configuration directory; `zjr doctor` checks both.
-- A Zellij server started from inside Claude Code passes `CLAUDECODE` to every
-  pane; Claude Code then runs as a child session and does not report
-  conversation switches. `zjr doctor` warns about it.
-- Uninstalling while saved sessions still refer to `zclaude` leaves those panes
-  unable to start.
+- Only CLIs running in the pane itself are seen. In an ssh session or a
+  nested multiplexer, Zellij and the plugin see the outer program.
+- Zellij must keep `session_serialization` on (the default).
+- Built and tested with Zellij 0.45.1. Plugin API changes in later versions
+  may need a rebuild.
+- Sometimes a Zellij server is started from inside Claude Code. It then
+  passes `CLAUDECODE` to every pane, and Claude Code runs as a child session
+  that does not report conversation switches.
+- Zellij keys the plugin's cache folder by the URL as written, and the grant
+  by the file. Changing how `config.kdl` names the plugin (`~/` or an
+  absolute path) starts a new map. Moving the file also needs the grant
+  again.
+- Reload types the command into the pane's shell as `cd -- '<dir>' && claude
+  ...`, which bash, zsh, dash and fish accept. Other shells may not.
 
 ## Tests
 
 ```sh
+(cd plugin && cargo test)                         # argument handling, parsing
 cd tests
-python3 -m unittest test_unit test_launcher          # about a minute
-ZJR_E2E=1 python3 -m unittest test_zellij            # real Zellij: crash/resurrect twice; Alt r reload
-tests/run-linux.sh                                   # all of it on Arch Linux ARM, bash and dash as /bin/sh
+python3 -m unittest test_install                  # install.sh / uninstall.sh
+ZJR_E2E=1 python3 -m unittest test_plugin         # real Zellij: crash, resurrect, reload
+tests/run-linux.sh                                # all of it on Arch Linux ARM, bash and dash as /bin/sh
 ```
 
-`run-linux.sh` uses Apple's `container` (`brew install container`); the host
+The end-to-end tests have a setup of their own:
+- Each starts real Zellij servers with a throwaway HOME, configuration and
+  socket directory. They never touch your own sessions.
+- The plugin is installed with `install.sh --edit-config`.
+- Fake `claude` and `codex` executables behave like the real ones on disk:
+  the registry, transcripts and rollout files.
+- A crash is SIGKILL to the server, and the session is then attached again.
+
+`run-linux.sh` uses Apple's `container` (`brew install container`). The host
 downloads the packages, so it works where the VM has no network of its own.
 
-The tests use fake `claude` / `codex` executables that behave like the real
-ones on disk (registry, transcripts, rollout files), real processes on
-pseudo-terminals, SIGKILL for crashes, and a real interactive zsh for job
-control. The Zellij test runs servers with a throwaway HOME, configuration
-and socket directory, so it never touches your own sessions.
+## History
 
-## Compared with [zellij-claude-enhance](https://github.com/Shengfeng233/zellij-claude-enhance)
+Earlier versions were wrappers (`zclaude`, `zcodex`) that you started instead
+of the CLIs. They are retired. If you installed them, `./uninstall.sh` from
+commit `ad7b25c` removes them.
 
-This is a rewrite rather than a port. It keeps the idea (a token in the
-pane's saved command) and drops what needed dotfile edits, ran on every
-discovery tick, or could not work on macOS: the rc-file colour fix, the
-command-discovery hook, the Linux-only Zellij upgrader and dispatcher,
-the Ctrl+Y PTY proxies, and the prebuilt status-bar plugin.
+Compared with
+[zellij-claude-enhance](https://github.com/Shengfeng233/zellij-claude-enhance):
+there are no shell rc changes, no command-discovery hook, no wrappers and no
+PTY proxy. It works on macOS, and it covers Codex as well as Claude Code.
 
 ## License
 

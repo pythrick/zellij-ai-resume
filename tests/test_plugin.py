@@ -8,8 +8,10 @@ Opt-in (it builds the plugin and starts real Zellij servers):
     ZJR_E2E=1 python3 -m unittest test_plugin
 
 Each test runs its own server with a throwaway HOME, Zellij configuration and
-socket directory, and the fake CLIs from tests/fakes."""
+socket directory, and the fake CLIs from tests/fakes. The plugin is put in
+place by install.sh --edit-config, as a user would."""
 
+import fnmatch
 import glob
 import json
 import os
@@ -28,6 +30,7 @@ PLUGIN = os.path.join(ROOT, "plugin")
 WASM = os.environ.get("ZJR_PLUGIN_WASM") or os.path.join(PLUGIN, "target", "wasm32-wasip1", "release",
                                                           "zellij-ai-resume.wasm")
 SESSION = "zjr-plugin"
+URL = "file:~/.config/zellij/plugins/zellij-ai-resume.wasm"  # what install.sh writes and prints
 PERMISSIONS = ("ReadApplicationState", "RunCommands", "WriteToStdin", "Reconfigure", "ReadCliPipes", "ChangeApplicationState")
 
 
@@ -46,24 +49,28 @@ class PluginTest(unittest.TestCase):
         self.addCleanup(self.box.close)
         self.sockets = tempfile.mkdtemp(prefix="zjr-plugin-", dir="/tmp")
         self.addCleanup(shutil.rmtree, self.sockets, True)
-        home = self.box.env["HOME"]
-        config_dir = os.path.join(self.box.dir, "zellij-config")
-        os.mkdir(config_dir)
+        home = self.box.home
         shell = os.path.join(self.box.dir, "shell")
         with open(shell, "w") as handle:
             handle.write("#!/bin/sh\nexec /bin/bash --norc --noprofile -i\n")
         os.chmod(shell, 0o755)
-        self.config = os.path.join(config_dir, "config.kdl")
-        with open(self.config, "w") as handle:
+        path = os.pathsep.join([self.box.fakes, os.path.dirname(ZELLIJ), self.box.env["PATH"]])
+        self.env = dict(self.box.env, PATH=path, ZELLIJ_SOCKET_DIR=self.sockets, SHELL=shell)
+        config_dir = os.path.join(home, ".config", "zellij")
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "config.kdl"), "w") as handle:
             handle.write(f'default_shell "{shell}"\nserialization_interval 1\nshow_startup_tips false\n'
-                         f'show_release_notes false\nload_plugins {{\n    "file:{WASM}"\n}}\n')
-        # The one-time grant (`zellij plugin -- file:...`, then y), as Zellij caches it.
-        grant = f'"{WASM}" {{\n' + "".join(f"    {name}\n" for name in PERMISSIONS) + "}\n"
+                         'show_release_notes false\n')
+        installed = subprocess.run(["/bin/sh", os.path.join(ROOT, "install.sh"), "--wasm", WASM, "--edit-config"],
+                                   env=self.env, capture_output=True, text=True)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn(f"zellij plugin -- '{URL}'", installed.stdout)
+        # The one-time grant (`zellij plugin -- ...`, then y), as Zellij caches it.
+        grant = f'"{config_dir}/plugins/zellij-ai-resume.wasm" {{\n' + "".join(f"    {name}\n" for name in PERMISSIONS) + "}\n"
         for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):
             os.makedirs(os.path.join(home, cache), exist_ok=True)
             with open(os.path.join(home, cache, "permissions.kdl"), "w") as handle:
                 handle.write(grant)
-        self.env = dict(self.box.env, ZELLIJ_CONFIG_DIR=config_dir, ZELLIJ_SOCKET_DIR=self.sockets, SHELL=shell)
         self.clients = []
         self.addCleanup(self.cleanup)
 
@@ -92,8 +99,7 @@ class PluginTest(unittest.TestCase):
         return self.zellij("--session", SESSION, "action", *args)
 
     def attach(self, create=False):
-        client = Pane([ZELLIJ, "--config", self.config, "attach", *(["--create"] if create else []), SESSION],
-                      self.env, self.box.work)
+        client = Pane([ZELLIJ, "attach", *(["--create"] if create else []), SESSION], self.env, self.box.work)
         self.clients.append(client)
         return client
 
@@ -123,9 +129,13 @@ class PluginTest(unittest.TestCase):
                         interval=0.5, what="a new pane")
 
     def saved(self):
-        home = self.env["HOME"]
-        files = glob.glob(f"{home}/Library/Caches/org.Zellij-Contributors.Zellij/**/plugin_cache/session-*.json", recursive=True)
-        files += glob.glob(f"{home}/.cache/zellij/**/plugin_cache/session-*.json", recursive=True)
+        # The plugin's /cache, in Zellij's cache folder under a path made from
+        # the plugin's URL (file:~/.config/...: a hidden folder, which glob skips).
+        files = []
+        for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):
+            for folder, _, names in os.walk(os.path.join(self.box.home, cache)):
+                if os.path.basename(folder) == "plugin_cache":
+                    files += [os.path.join(folder, name) for name in names if fnmatch.fnmatch(name, "session-*.json")]
         if not files:
             return {}
         try:
@@ -252,7 +262,7 @@ class FirstRun(PluginTest):
         session = self.box.wait_event(event="start", timeout=15)["session"]
         time.sleep(3)
         self.assertEqual(self.saved(), {})  # the background plugin waits for permission
-        self.zellij("--session", SESSION, "plugin", "--", f"file:{WASM}")  # what the install step says
+        self.zellij("--session", SESSION, "plugin", "--", URL)  # what install.sh says to do
         time.sleep(2)
         os.write(client.master, b"y")
         self.recorded(session)
@@ -262,32 +272,66 @@ class Reload(PluginTest):
     def test_the_reload_key_restarts_the_focused_cli(self):
         client = self.start(FAKE_CLEAR_AFTER=2)
         pane = self.terminals()[0]["id"]
+        self.type(pane, "sleep 307 &")  # a job of the same shell, which reload leaves alone
         self.type(pane, "mkdir -p sub && cd sub && claude --verbose 'a prompt'")
         first = self.box.wait_event(event="start", timeout=15)
         cleared = self.box.wait_event(event="clear", timeout=15)["session"]
         self.recorded(cleared)
+        job = next(int(line.split()[0]) for line in self.processes(pid=True) if line.split()[1:] == ["sleep", "307"])
+        self.addCleanup(subprocess.run, ["kill", "-9", str(job)], capture_output=True)
         os.write(client.master, b"\x1br")  # Alt r
         self.assertEqual(self.box.wait_event(event="signal", timeout=10)["signum"], signal.SIGTERM)
         again = self.box.wait_event(event="start", skip=1, timeout=15)
         self.assertEqual(again["argv"], ["--resume", cleared, "--verbose"])
         self.assertEqual(again["cwd"], first["cwd"])
         self.assertEqual(len(self.terminals()), 1)
+        os.kill(job, 0)  # still running
         os.write(client.master, b"\x1bn")  # Alt n: the plugin's binding left the others alone
         wait_for(lambda: len(self.terminals()) == 2, interval=0.5, what="Alt n to open a pane")
 
-    def test_pipe_reload_of_a_restored_pane(self):
+    def test_a_configured_reload_key(self):
+        config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
+        with open(config) as handle:
+            text = handle.read()
+        with open(config, "w") as handle:
+            handle.write(text.replace(f'"{URL}"', f'"{URL}" {{\n        reload_key "Alt y"\n    }}'))
+        client = self.start()
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
+        os.write(client.master, b"\x1by")  # Alt y
+        self.assertEqual(self.box.wait_event(event="signal", timeout=10)["signum"], signal.SIGTERM)
+        self.box.wait_event(event="start", skip=1, timeout=15)
+
+    def test_pipe_reload_of_a_restored_pane_by_its_id(self):
         self.start()
         self.type(self.terminals()[0]["id"], "claude --verbose")
         session = self.box.wait_event(event="start", timeout=15)["session"]
         self.recorded(session)
         self.crash_and_attach()
         restored = self.box.wait_event(event="start", skip=1, timeout=20)
+        pane = self.terminals()[0]["id"]  # the restored pane is a new one
+        self.new_pane()  # focused now, and runs no CLI
         time.sleep(3)  # the plugin sees the restored pane
-        self.zellij("--session", SESSION, "pipe", "--name", "zjr-reload", "--", "reload")
+        self.zellij("--session", SESSION, "pipe", "--name", "zjr-reload", "--", "no-such-pane")  # ignored
+        self.zellij("--session", SESSION, "pipe", "--name", "zjr-reload", "--", f"terminal_{pane}")
         again = self.box.wait_event(event="start", skip=2, timeout=15)
         self.assertEqual(again["argv"], ["--resume", session, "--verbose"])
         self.assertNotEqual(again["pid"], restored["pid"])
 
+    def test_reload_from_inside_claude(self):
+        # `! zellij pipe --name zjr-reload -- reload` typed into Claude Code.
+        output = os.path.join(self.box.dir, "pipe.out")
+        self.start(FAKE_RUN_AFTER=4, FAKE_RUN=f"{ZELLIJ} pipe --name zjr-reload -- reload", FAKE_RUN_OUTPUT=output)
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        first = self.box.wait_event(event="start", timeout=15)
+        self.box.wait_event(event="ran", timeout=15)
+        again = self.box.wait_event(event="start", skip=1, timeout=15)
+        self.assertEqual(again["argv"], ["--resume", first["session"], "--verbose"])
+        wait_for(lambda: not any(p.split()[1:3] == ["pipe", "--name"] for p in self.processes()), what="zellij pipe to exit")
+
+    def processes(self, pid=False):
+        columns = "pid=,args=" if pid else "args="
+        return subprocess.run(["ps", "-A", "-o", columns], capture_output=True, text=True).stdout.splitlines()
 
 if __name__ == "__main__":
     unittest.main()
