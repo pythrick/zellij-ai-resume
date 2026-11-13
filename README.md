@@ -101,16 +101,25 @@ How it starts again depends on the pane:
 - A resurrected pane is replaced in place.
 
 The binding is added to the running session, not written to your
-configuration. To change or drop it, give the plugin a `reload_key`
-(`""` for none):
+configuration.
+
+## Configuration
+
+Settings go in a block after the plugin's line in `load_plugins`:
 
 ```kdl
 load_plugins {
     "file:~/.config/zellij/plugins/zellij-ai-resume.wasm" {
         reload_key "Ctrl Alt r"
+        exit_grace "60"
     }
 }
 ```
+
+| Setting | Default | What |
+|---|---|---|
+| `reload_key` | `Alt r` | the reload key; `""` for none |
+| `exit_grace` | `60` | seconds an exited CLI is still brought back if its session ends meanwhile (see [Shutdowns](#shutdowns-and-logouts)) |
 
 ## How it works
 
@@ -138,9 +147,10 @@ conversation, the directory and the arguments.
 
 Panes are identified by position: tab, then floating or tiled, top to bottom,
 left to right. A resurrected layout reproduces those positions. The map is
-kept in the plugin's cache folder, which outlives the server. After every
-change the plugin asks Zellij to save the session, so the layout and the map
-always describe the same moment.
+kept in the plugin's cache folder, which outlives the server. When a CLI
+appears or changes conversation, or panes open or close, the plugin asks
+Zellij to save the session, so the layout and the map describe the same
+moment.
 
 When a session is resurrected, the plugin looks at the panes Zellij holds
 for Enter. If a pane's position is in the map and the same CLI is waiting
@@ -149,6 +159,29 @@ the pane in place with the command that resumes it, in its directory. For a
 directory Zellij would remap for plugins (`/tmp`, `/data`, `/cache`, `/host`),
 the command enters the directory itself:
 `/bin/sh -c 'cd -- "$1" && shift && exec "$@"' zellij-ai-resume DIR claude ...`.
+
+### Shutdowns and logouts
+
+A restart, shutdown or logout sends SIGTERM to every process. The CLIs exit
+at once, and Zellij and the shells outlive them by a moment. Zellij's last
+save can then show a shell where a CLI ran.
+
+So a CLI that exits keeps its entry in the map for `exit_grace` (60 seconds),
+and the plugin never asks Zellij to save because a CLI exited. If the session
+ends within that time, the CLI comes back with the others.
+
+If Zellij brought such a pane back as a shell, the plugin replaces the shell
+too, but only when all of these hold:
+- **another server wrote the map**, so a plugin restart inside a running
+  session never does it;
+- **Zellij resurrected the session.** The plugin checks that Zellij had a
+  saved layout for it when the session started; a new session that reuses a
+  deleted session's name has none;
+- **every tab has the same number of panes** as when the map was written;
+- **the pane is an idle shell.** That is a plain shell with nothing running,
+  or a shell Zellij holds waiting for Enter.
+
+A CLI you quit more than `exit_grace` before the session ended stays quit.
 
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured. When several copies of
 the plugin run in one session (the background one and one opened in a pane),
@@ -194,9 +227,14 @@ The plugin asks for six permissions:
 - **Reload signals only the CLI's own processes**: the pane's foreground
   job and its children, from the same listing.
 - **Unlike Zellij's default, resurrected CLI panes start without Enter.**
-  This applies only to panes whose position and CLI match what the plugin
-  recorded, in the first 20 seconds after the session loads. It runs a
-  command the plugin builds, never the saved command line.
+  This applies only to panes whose position matches what the plugin
+  recorded, in the first 30 seconds after the session loads. The pane must
+  hold the same CLI, or be an idle shell under the conditions in
+  [Shutdowns](#shutdowns-and-logouts). It runs a command the plugin builds,
+  never the saved command line.
+- **A Claude Code process counts as live only if its pid still runs Claude
+  Code.** A reboot leaves registry entries behind whose pids get reused, and
+  a conversation open in a live process is continued in a copy instead.
 
 ## Limitations
 
@@ -214,6 +252,11 @@ The plugin asks for six permissions:
   again.
 - Reload types the command into the pane's shell as `cd -- '<dir>' && claude
   ...`, which bash, zsh, dash and fish accept. Other shells may not.
+- A CLI you quit less than `exit_grace` before its session ended comes back
+  with the others.
+- A shell pane brought back as a CLI is a Zellij command pane, as Zellij's
+  own resurrection makes it. When the CLI exits, Zellij offers to run it
+  again rather than returning to a shell.
 
 ## Tests
 

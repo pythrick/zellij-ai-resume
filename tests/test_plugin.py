@@ -50,10 +50,10 @@ class PluginTest(unittest.TestCase):
         self.sockets = tempfile.mkdtemp(prefix="zjr-plugin-", dir="/tmp")
         self.addCleanup(shutil.rmtree, self.sockets, True)
         home = self.box.home
-        shell = os.path.join(self.box.dir, "shell")
-        with open(shell, "w") as handle:
-            handle.write("#!/bin/sh\nexec /bin/bash --norc --noprofile -i\n")
-        os.chmod(shell, 0o755)
+        # The default shell itself, as Zellij usually runs it: a shell pane
+        # is then saved as a plain pane, without a command (the HOME is empty,
+        # so there are no startup files).
+        shell = "/bin/bash"
         path = os.pathsep.join([self.box.fakes, os.path.dirname(ZELLIJ), self.box.env["PATH"]])
         self.env = dict(self.box.env, PATH=path, ZELLIJ_SOCKET_DIR=self.sockets, SHELL=shell)
         config_dir = os.path.join(home, ".config", "zellij")
@@ -159,6 +159,30 @@ class PluginTest(unittest.TestCase):
     def starts(self, tool="claude"):
         return self.box.events(tool=tool, event="start")
 
+    def configure(self, serialization_interval=None, **plugin):
+        """Change config.kdl: Zellij's save interval, the plugin's settings."""
+        config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
+        with open(config) as handle:
+            text = handle.read()
+        if serialization_interval is not None:
+            text = text.replace("serialization_interval 1\n", f"serialization_interval {serialization_interval}\n")
+        if plugin:
+            settings = "".join(f'        {key} "{value}"\n' for key, value in plugin.items())
+            text = text.replace(f'"{URL}"\n', f'"{URL}" {{\n{settings}    }}\n')
+        with open(config, "w") as handle:
+            handle.write(text)
+
+    def saved_layout(self):
+        """What Zellij saved to resurrect the session from."""
+        for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):
+            path = os.path.join(self.box.home, cache, "contract_version_1", "session_info", SESSION, "session-layout.kdl")
+            try:
+                with open(path) as handle:
+                    return handle.read()
+            except FileNotFoundError:
+                continue
+        return ""
+
 
 class Resurrection(PluginTest):
     def test_plain_claude_resumes_in_its_directory(self):
@@ -234,6 +258,85 @@ class Resurrection(PluginTest):
         self.assertTrue(codex["cwd"].endswith("/work/c"))
         self.assertEqual(len(self.terminals()), 4)  # the shell pane came back as a shell
 
+    def test_a_shutdown_that_stops_the_clis_first(self):
+        # A reboot or logout: every process gets SIGTERM, the CLIs exit, the
+        # shells and Zellij outlive them a moment, and Zellij saves its layout
+        # once more, with plain shells where the CLIs ran.
+        self.shut_down_and_come_back(start_shell="")
+
+    def test_a_shutdown_with_the_clis_in_a_nested_shell(self):
+        # Zellij saves a shell other than the default one as the pane's
+        # command, and brings the pane back holding it, waiting for Enter.
+        self.shut_down_and_come_back(start_shell="bash --norc && ")
+
+    def shut_down_and_come_back(self, start_shell):
+        self.start(FAKE_ROLLOUT_DELAY=1)
+        first = self.terminals()[0]["id"]
+        if start_shell:
+            self.type(first, start_shell.removesuffix(" && "))
+            time.sleep(1)
+        self.type(first, "mkdir -p a && cd a && claude --model one")
+        self.new_pane()  # a plain shell beside it
+        self.action("new-tab", "--cwd", self.box.work)
+        wait_for(lambda: len(self.terminals()) == 3, interval=0.5, what="the second tab")
+        tab2 = max(pane["id"] for pane in self.terminals())
+        self.type(tab2, "mkdir -p c && cd c && codex --search")
+        claude = self.box.wait_event(event="start", timeout=15)
+        codex_session = self.box.wait_event(tool="codex", event="rollout", timeout=15)["session"]
+        self.recorded(claude["session"])
+        self.recorded(codex_session)
+        time.sleep(2.5)
+        codex = self.starts("codex")[0]
+        for pid in (claude["pid"], codex["pid"]):
+            os.kill(pid, signal.SIGTERM)
+        wait_for(lambda: "fakes/claude" not in self.saved_layout() and "fakes/codex" not in self.saved_layout(),
+                 timeout=15, what="Zellij to save shells where the CLIs ran")
+        if start_shell:
+            self.assertIn("--norc", self.saved_layout())  # the nested shell, as the pane's command
+        time.sleep(3)  # the plugin's probes see both gone
+        self.assertEqual(sorted(entry["session_id"] for entry in self.saved().values()), sorted([claude["session"], codex_session]))
+        os.kill(self.server(), signal.SIGKILL)
+        wait_for(lambda: self.server() is None, what="the server to die")
+        for client in self.clients:
+            client.close()
+        self.attach()
+        wait_for(lambda: len(self.starts()) == 2 and len(self.starts("codex")) == 2, timeout=25, what="both back")
+        self.assertEqual(self.starts()[1]["argv"], ["--resume", claude["session"], "--model", "one"])
+        self.assertEqual(self.starts()[1]["cwd"], claude["cwd"])
+        self.assertEqual(self.starts("codex")[1]["argv"], ["resume", "--search", codex_session])
+        self.assertEqual(self.starts("codex")[1]["cwd"], codex["cwd"])
+        self.assertEqual(len(self.terminals()), 3)  # the shell beside Claude is still a shell
+
+    def test_a_cli_quit_well_before_the_end_stays_quit(self):
+        self.configure(exit_grace=2)
+        self.start(FAKE_EXIT_AFTER=2)
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
+        self.box.wait_event(event="exit", timeout=10)
+        wait_for(lambda: self.saved() == {}, timeout=15, what="the plugin to forget it")
+        self.crash_and_attach()
+        time.sleep(8)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_a_new_session_named_like_a_deleted_one_is_left_alone(self):
+        self.start()
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
+        time.sleep(2.5)
+        os.kill(self.server(), signal.SIGKILL)
+        wait_for(lambda: self.server() is None, what="the server to die")
+        for client in self.clients:
+            client.close()
+        self.zellij("delete-session", SESSION)
+        self.assertEqual(self.saved_layout(), "")
+        # Zellij's default: a new session saves its first layout a minute in.
+        self.configure(serialization_interval=60)
+        self.attach(create=True)
+        wait_for(lambda: self.terminals(), timeout=30, interval=0.5, what="the new session")
+        time.sleep(8)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(len(self.terminals()), 1)
+
     def test_a_conversation_that_is_gone_starts_fresh_without_its_prompt(self):
         self.start()
         self.type(self.terminals()[0]["id"], "claude --verbose 'do the thing'")
@@ -249,6 +352,26 @@ class Resurrection(PluginTest):
         self.attach()
         fresh = self.box.wait_event(event="start", skip=1, timeout=20)
         self.assertEqual(fresh["argv"], ["--verbose"])
+
+
+class Upgrade(PluginTest):
+    def test_restarting_the_plugin_in_a_running_session_changes_no_pane(self):
+        # `zellij action start-or-reload-plugin`, as after reinstalling: the
+        # plugin starts again in the session that wrote its map. A CLI quit
+        # moments before is still in the map, but its shell is left alone.
+        self.start(FAKE_EXIT_AFTER=3)
+        pane = self.terminals()[0]["id"]
+        self.type(pane, "claude --verbose")
+        session = self.box.wait_event(event="start", timeout=15)["session"]
+        self.recorded(session)
+        self.box.wait_event(event="exit", timeout=10)
+        time.sleep(3)
+        self.assertIn(session, [entry["session_id"] for entry in self.saved().values()])  # kept for exit_grace
+        self.zellij("--session", SESSION, "action", "start-or-reload-plugin", URL)
+        time.sleep(10)
+        self.assertEqual(len(self.starts()), 1)
+        self.type(pane, "FAKE_EXIT_AFTER= claude --model two")  # and it follows what starts next
+        self.recorded(self.box.wait_event(event="start", skip=1, timeout=15)["session"])
 
 
 class FirstRun(PluginTest):
@@ -301,11 +424,7 @@ class Reload(PluginTest):
         self.assertNotIn("failed", again)
 
     def test_a_configured_reload_key(self):
-        config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
-        with open(config) as handle:
-            text = handle.read()
-        with open(config, "w") as handle:
-            handle.write(text.replace(f'"{URL}"', f'"{URL}" {{\n        reload_key "Alt y"\n    }}'))
+        self.configure(reload_key="Alt y")
         client = self.start()
         self.type(self.terminals()[0]["id"], "claude --verbose")
         self.recorded(self.box.wait_event(event="start", timeout=15)["session"])

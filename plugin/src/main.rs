@@ -15,6 +15,11 @@
 //! When the session is resurrected, each restored CLI pane is replaced in
 //! place by the command that resumes its conversation, in its directory. A
 //! pane whose command no longer matches the map is left alone.
+//!
+//! A shutdown or logout stops the CLIs a moment before Zellij, so a CLI that
+//! exits keeps its place in the map for a while (`exit_grace`), and Zellij's
+//! last save may show a shell where it ran. Such a shell is replaced too, but
+//! only in a session Zellij resurrected, laid out as the map describes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -29,15 +34,21 @@ use zellij_tile::prelude::*;
 
 const TICK: f64 = 2.0;
 const FAST_TICK: f64 = 0.3;
-const RESTORE_WINDOW: Duration = Duration::from_secs(20);
+const RESTORE_WINDOW: Duration = Duration::from_secs(30);
 const RELOAD_GRACE: Duration = Duration::from_secs(5);
 const RELOAD_GIVE_UP: Duration = Duration::from_secs(12);
 const STALE_COMMAND: Duration = Duration::from_secs(15);
+/// How long an exited CLI keeps its entry (configurable as `exit_grace`).
+const EXIT_GRACE: Duration = Duration::from_secs(60);
 const MAP_FORMAT: u32 = 1;
 const MAP_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const PIPE_NAME: &str = "zjr-reload";
 /// Marks the commands that enter their directory themselves (see `command_in`).
 const MARKER: &str = "zellij-ai-resume";
+/// What an idle pane runs: a shell, which a restore may replace.
+const SHELLS: &[&str] = &[
+    "sh", "ash", "bash", "dash", "zsh", "fish", "ksh", "mksh", "oksh", "yash", "csh", "tcsh", "nu", "elvish", "xonsh", "pwsh",
+];
 
 /// One host command per tick: the process table (with process groups, to
 /// tell a shell's foreground job from its background ones), Claude Code's
@@ -79,8 +90,34 @@ if [ $# -gt 0 ]; then
 fi
 "#;
 
+/// Where this server comes from, asked once at load. Run in the plugin's
+/// /data folder, which Zellij keeps at <cache>/<server id>/<plugin url>/...:
+/// prints `server <id>` (a fresh id per server process), and `layout` if
+/// Zellij has a saved layout for the session named in $1, which it has when
+/// it resurrected the session and not when it created a new one (a new
+/// session saves its first layout only after `serialization_interval`).
+const ORIGIN: &str = r#"
+dir=$(pwd -P)
+while [ -n "$dir" ] && [ "$dir" != / ]; do
+    cache=${dir%/*}
+    found=
+    for info in "$cache"/contract_version_*/session_info; do
+        [ -d "$info" ] || continue
+        found=1
+        [ -f "$info/$1/session-layout.kdl" ] && echo layout
+    done
+    if [ -n "$found" ]; then
+        echo "server ${dir##*/}"
+        exit 0
+    fi
+    dir=$cache
+done
+"#;
+
 /// Which conversations still exist, and which Claude Code ones are open in a
 /// live process: `claude:<id>` / `codex:<id>` lines, then `live:<id>` lines.
+/// A registry entry counts only if its pid is still a Claude Code process: a
+/// reboot leaves entries behind whose pids are reused.
 const CHECK: &str = r#"
 claude="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 codex="${CODEX_HOME:-$HOME/.codex}"
@@ -94,7 +131,8 @@ done
 for f in "$claude"/sessions/*.json; do
     [ -f "$f" ] || continue
     pid=${f##*/}; pid=${pid%.json}
-    kill -0 "$pid" 2>/dev/null && sed -n 's/.*"sessionId" *: *"\([^"]*\)".*/live:\1/p' "$f"
+    ps -o args= -p "$pid" 2>/dev/null | grep -q claude || continue
+    sed -n 's/.*"sessionId" *: *"\([^"]*\)".*/live:\1/p' "$f"
 done
 "#;
 
@@ -111,6 +149,20 @@ struct Entry {
 struct Map {
     format: u32,
     panes: BTreeMap<String, Entry>,
+    /// The server that wrote it, to tell a resurrected session from the
+    /// plugin restarting in a running one.
+    #[serde(default)]
+    server: Option<String>,
+    /// Terminal panes per tab when it was written.
+    #[serde(default)]
+    shape: Vec<usize>,
+}
+
+/// What this server is, learned once at load (see ORIGIN).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Origin {
+    server: Option<String>, // Zellij's id for this server process
+    layout: bool,           // Zellij had a saved layout of this session: it resurrected it
 }
 
 /// A CLI found running in a pane.
@@ -140,6 +192,7 @@ struct Restore {
     key: String,
     tool: Tool,
     entry: Entry,
+    shell: bool, // Zellij brought the pane back as a shell, not as the CLI waiting for Enter
 }
 
 #[derive(Debug)]
@@ -153,6 +206,7 @@ struct Reload {
 #[derive(Default)]
 struct State {
     reload_key: String,
+    exit_grace: Duration,
     plugin_id: u32,
     granted: bool,
     session: Option<String>,
@@ -160,15 +214,22 @@ struct State {
     tabs: Vec<TabInfo>,
     loaded: Option<Instant>,
     saved: Option<Map>,
+    origin: Option<Origin>,
+    origin_sent: Option<Instant>,
     handled: HashSet<String>,
+    restored: HashSet<String>, // positions replaced by a resumed CLI
     restores: Vec<Restore>,
     live: HashMap<u32, Live>,
+    ended: HashMap<u32, (Live, Instant)>, // CLIs that exited, kept for `exit_grace`
     probing: Vec<Running>,
     probe_sent: Option<Instant>,
     check_sent: Option<Instant>,
     reloads: Vec<Reload>,
     reload_checks: HashMap<u32, Live>, // reloads waiting to learn whether their conversation is on disk
     written: Option<String>,
+    written_panes: BTreeMap<String, Entry>,
+    written_shape: Vec<usize>,
+    told: bool, // whether the restore decision has been logged
     bound: bool,
     notes: Vec<String>,
 }
@@ -178,6 +239,13 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.reload_key = configuration.get("reload_key").cloned().unwrap_or_else(|| "Alt r".to_string());
+        self.exit_grace = EXIT_GRACE;
+        if let Some(text) = configuration.get("exit_grace") {
+            match text.trim().parse::<u64>() {
+                Ok(seconds) => self.exit_grace = Duration::from_secs(seconds),
+                Err(_) => self.note(format!("exit_grace {text:?} is not a number of seconds")),
+            }
+        }
         self.plugin_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -250,6 +318,12 @@ impl ZellijPlugin for State {
                         if let Some(pane) = context.get("pane").and_then(|pane| pane.parse().ok()) {
                             self.on_reload_check(pane, &output);
                         }
+                    }
+                    Some("origin") => {
+                        let origin = parse_origin(&output);
+                        self.note(format!("server {}, {}", origin.server.as_deref().unwrap_or("(unknown)"),
+                                          if origin.layout { "resurrected" } else { "not resurrected" }));
+                        self.origin = Some(origin);
                     }
                     _ => {}
                 }
@@ -354,6 +428,15 @@ impl State {
             self.note(format!("session {session}: {count} pane(s) saved before"));
             forget_old_maps();
             self.bind_reload_key();
+            let mut context = BTreeMap::new();
+            context.insert("kind".to_string(), "origin".to_string());
+            run_command_with_env_variables_and_cwd(&["/bin/sh", "-c", ORIGIN, "origin", &session], BTreeMap::new(),
+                                                   PathBuf::from("/data"), context);
+            self.origin_sent = Some(Instant::now());
+        }
+        if self.origin.is_none() && self.origin_sent.map_or(false, |sent| sent.elapsed() > STALE_COMMAND) {
+            self.note("no answer about this server: restoring only panes Zellij kept waiting".to_string());
+            self.origin = Some(Origin::default());
         }
         if self.restoring() {
             self.restore();
@@ -388,24 +471,50 @@ impl State {
 
     // --- restoring a resurrected session ------------------------------------------------
 
+    /// Whether this plugin may restore anything: not when this server wrote
+    /// the map (the plugin restarted in a running session).
+    fn may_restore(&self) -> bool {
+        match (&self.origin, &self.saved) {
+            (Some(origin), Some(saved)) => origin.server.is_none() || saved.server != origin.server,
+            _ => false,
+        }
+    }
+
+    /// Whether panes Zellij brought back as shells may be restored: only in a
+    /// session Zellij resurrected, with the panes of each tab the map knew.
+    fn may_restore_shells(&self) -> bool {
+        let layout = self.origin.as_ref().map_or(false, |origin| origin.layout);
+        layout && self.may_restore() && self.saved.as_ref().map_or(false, |saved| saved.shape == shape(&self.panes))
+    }
+
     fn restore(&mut self) {
-        if self.check_sent.map_or(false, |sent| sent.elapsed() < STALE_COMMAND) {
+        if self.check_sent.map_or(false, |sent| sent.elapsed() < STALE_COMMAND) || !self.may_restore() {
             return;
+        }
+        let shells = self.may_restore_shells();
+        if !self.told {
+            self.told = true;
+            let layout = self.origin.as_ref().map_or(false, |origin| origin.layout);
+            let saved_shape = self.saved.as_ref().map(|saved| saved.shape.clone()).unwrap_or_default();
+            self.note(format!("restoring held panes{}; tabs {:?}, saved {:?}, layout {layout}",
+                              if shells { " and shells" } else { "" }, shape(&self.panes), saved_shape));
         }
         let Some(saved) = &self.saved else { return };
         let mut todo = Vec::new();
         for (key, pane) in positions(&self.panes) {
-            if !pane.is_held || self.handled.contains(&key) {
+            if self.handled.contains(&key) {
                 continue;
             }
             let Some(entry) = saved.panes.get(&key) else { continue };
-            let words: Vec<String> = pane.terminal_command.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();
             let Some(tool) = Tool::from_name(&entry.tool) else { continue };
-            let ours = words.iter().any(|word| word == MARKER) && words.iter().any(|word| word == tool.name());
-            if !ours && cli::identify(&words).map(|found| found.0) != Some(tool) {
-                continue; // something else runs at this position now
-            }
-            todo.push(Restore { pane: pane.id, key, tool, entry: entry.clone() });
+            let shell = if pane.is_held && waits_with(&pane, tool) {
+                false
+            } else if shells && (holds_shell(&pane) || idle_shell(&pane)) {
+                true
+            } else {
+                continue; // something else is at this position now
+            };
+            todo.push(Restore { pane: pane.id, key, tool, entry: entry.clone(), shell });
         }
         if todo.is_empty() {
             return;
@@ -426,10 +535,19 @@ impl State {
         let live: HashSet<&str> = output.lines().filter_map(|line| line.strip_prefix("live:")).collect();
         let mut resumed: HashSet<String> = HashSet::new();
         for restore in std::mem::take(&mut self.restores) {
-            // Still the restored pane, waiting? (Enter may have been pressed meanwhile.)
-            let still_held = self.panes.values().flatten().any(|pane| !pane.is_plugin && pane.id == restore.pane && pane.is_held);
+            // Still as it was? Enter may have been pressed meanwhile, or the
+            // shell be busy with its startup files (then try again).
+            let pane = self.panes.values().flatten().find(|pane| !pane.is_plugin && pane.id == restore.pane).cloned();
+            let ready = match &pane {
+                Some(pane) if restore.shell => holds_shell(pane) || idle_shell(pane),
+                Some(pane) => pane.is_held,
+                None => false,
+            };
+            if !ready && restore.shell && pane.is_some() {
+                continue;
+            }
             self.handled.insert(restore.key.clone());
-            if !still_held {
+            if !ready {
                 continue;
             }
             let entry = &restore.entry;
@@ -444,7 +562,9 @@ impl State {
             };
             let opened = open_command_pane_in_place_of_pane_id(PaneId::Terminal(restore.pane), command_in(tool, &args, &entry.cwd),
                                                                true, BTreeMap::new());
-            self.note(format!("restored {} as {} {} in {} ({opened:?})", restore.key, tool.name(), args.join(" "), entry.cwd));
+            self.restored.insert(restore.key.clone());
+            let shell = if restore.shell { " (Zellij kept a shell there)" } else { "" };
+            self.note(format!("restored {}{shell} as {} {} in {} ({opened:?})", restore.key, tool.name(), args.join(" "), entry.cwd));
         }
     }
 
@@ -474,7 +594,7 @@ impl State {
             });
         }
         if running.is_empty() {
-            self.live.clear();
+            self.set_live(HashMap::new());
             self.persist();
             return;
         }
@@ -526,6 +646,11 @@ impl State {
             let mut pids: Vec<i32> = parent.keys().copied().filter(|pid| roots.iter().any(|root| descends_from(*pid, *root, &parent))).collect();
             pids.sort_unstable();
             let mut running = running;
+            // Until the CLI says where it runs, or while it exits (its registry
+            // entry gone, its files closed), what was known stands.
+            if let Some(known) = previous {
+                running.cwd = known.running.cwd.clone();
+            }
             let (session_id, exact) = match running.tool {
                 Tool::Claude => {
                     let found = registry
@@ -581,33 +706,61 @@ impl State {
             }
             live.insert(running.pane, Live { running, session_id, exact, pids, first_seen });
         }
-        self.live = live;
+        self.set_live(live);
         self.persist();
     }
 
-    /// Write the position -> conversation map and have Zellij save the layout
-    /// with it. Restored positions not yet replaced keep their saved entry.
+    /// Take in what the latest probe found. A CLI that is gone keeps its
+    /// entry for `exit_grace`, in case its session is ending too: a shutdown
+    /// or logout stops the CLIs a moment before Zellij.
+    fn set_live(&mut self, live: HashMap<u32, Live>) {
+        let present: HashSet<u32> = self.panes.values().flatten().filter(|pane| !pane.is_plugin).map(|pane| pane.id).collect();
+        for (pane, gone) in std::mem::take(&mut self.live) {
+            if !live.contains_key(&pane) && present.contains(&pane) {
+                self.ended.entry(pane).or_insert((gone, Instant::now()));
+            }
+        }
+        let grace = self.exit_grace;
+        self.ended.retain(|pane, (_, since)| !live.contains_key(pane) && present.contains(pane) && since.elapsed() < grace);
+        self.live = live;
+    }
+
+    /// Write the position -> conversation map, and have Zellij save the layout
+    /// when a CLI appeared or changed, or the panes did, so the two describe the
+    /// same moment. Not when a CLI exited: a shutdown is the moment not to save.
     fn persist(&mut self) {
         let Some(session) = self.session.clone() else { return };
+        let Some(server) = self.origin.as_ref().map(|origin| origin.server.clone()) else {
+            return; // not before knowing what there is to restore
+        };
         if self.loaded.is_none() {
             return;
         }
-        let mut map = Map { format: MAP_FORMAT, panes: BTreeMap::new() };
+        let shells = self.may_restore_shells();
+        let mut panes = BTreeMap::new();
         for (key, pane) in positions(&self.panes) {
-            if let Some(live) = self.live.get(&pane.id) {
+            let known = self.live.get(&pane.id).or_else(|| self.ended.get(&pane.id).map(|(live, _)| live));
+            if let Some(live) = known {
                 let running = &live.running;
-                map.panes.insert(key, Entry {
+                panes.insert(key, Entry {
                     tool: running.tool.name().to_string(),
                     args: running.args.clone(),
                     cwd: running.cwd.clone(),
                     session_id: live.session_id.clone(),
                 });
-            } else if pane.is_held && !self.handled.contains(&key) {
-                if let Some(entry) = self.saved.as_ref().and_then(|saved| saved.panes.get(&key)) {
-                    map.panes.insert(key, entry.clone());
+            } else if self.restoring() && self.may_restore() {
+                // To be restored still, or restored and not seen running yet.
+                let pending = !self.handled.contains(&key) && (pane.is_held || shells);
+                if pending || self.restored.contains(&key) {
+                    if let Some(entry) = self.saved.as_ref().and_then(|saved| saved.panes.get(&key)) {
+                        panes.insert(key, entry.clone());
+                    }
                 }
             }
         }
+        let gained = panes.iter().any(|(key, entry)| self.written_panes.get(key) != Some(entry));
+        let map = Map { format: MAP_FORMAT, panes, server, shape: shape(&self.panes) };
+        let moved = map.shape != self.written_shape;
         let Ok(text) = serde_json::to_string_pretty(&map) else { return };
         if self.written.as_deref() == Some(text.as_str()) {
             return;
@@ -617,7 +770,11 @@ impl State {
         match fs::write(&temporary, &text).and_then(|_| fs::rename(&temporary, &path)) {
             Ok(()) => {
                 self.written = Some(text);
-                let _ = save_session();
+                self.written_panes = map.panes;
+                self.written_shape = map.shape;
+                if gained || moved {
+                    let _ = save_session();
+                }
             }
             Err(error) => self.note(format!("cannot write {}: {error}", path.display())),
         }
@@ -777,6 +934,54 @@ fn signal(pids: &[i32], name: &str) {
     run(&command, "signal");
 }
 
+/// Whether a pane Zellij holds waits to run `tool`.
+fn waits_with(pane: &PaneInfo, tool: Tool) -> bool {
+    let words: Vec<String> = pane.terminal_command.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();
+    let ours = words.iter().any(|word| word == MARKER) && words.iter().any(|word| word == tool.name());
+    ours || cli::identify(&words).map(|found| found.0) == Some(tool)
+}
+
+/// Whether Zellij holds a pane waiting to start a plain shell: it saves a
+/// shell as the pane's command when it is not exactly the default one.
+fn holds_shell(pane: &PaneInfo) -> bool {
+    let words: Vec<&str> = pane.terminal_command.as_deref().unwrap_or("").split_whitespace().collect();
+    pane.is_held && words.first().map_or(false, |program| is_shell(program)) && !words.contains(&"-c")
+}
+
+/// Whether a pane is a plain shell with nothing running in it.
+fn idle_shell(pane: &PaneInfo) -> bool {
+    if pane.is_held || pane.exited || pane.terminal_command.is_some() {
+        return false;
+    }
+    let Ok(argv) = get_pane_running_command(PaneId::Terminal(pane.id)) else { return false };
+    argv.first().map_or(false, |program| is_shell(program))
+}
+
+fn is_shell(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program).trim_start_matches('-');
+    SHELLS.contains(&name)
+}
+
+/// Terminal panes per tab, in tab order.
+fn shape(panes: &HashMap<usize, Vec<PaneInfo>>) -> Vec<usize> {
+    let mut tabs: Vec<(usize, usize)> =
+        panes.iter().map(|(tab, panes)| (*tab, panes.iter().filter(|pane| !pane.is_plugin && !pane.is_suppressed).count())).collect();
+    tabs.sort_unstable();
+    tabs.into_iter().map(|(_, count)| count).collect()
+}
+
+fn parse_origin(output: &str) -> Origin {
+    let mut origin = Origin::default();
+    for line in output.lines() {
+        if let Some(id) = line.strip_prefix("server ") {
+            origin.server = Some(id.trim().to_string()).filter(|id| cli::is_uuid(id));
+        } else if line.trim() == "layout" {
+            origin.layout = true;
+        }
+    }
+    origin
+}
+
 /// Terminal panes keyed by position: tab, then (floating, y, x).
 fn positions(panes: &HashMap<usize, Vec<PaneInfo>>) -> Vec<(String, PaneInfo)> {
     let mut out = Vec::new();
@@ -929,6 +1134,92 @@ mod tests {
         assert_eq!(wrapped.args[2..], [MARKER, "/tmp/project", "claude", "--verbose"].map(String::from));
         assert_eq!(wrapped.cwd, None);
         assert_eq!(command_in(Tool::Codex, &[], "/datastore/x").path, PathBuf::from("codex")); // only whole names
+    }
+
+    const SERVER: &str = "3dd72776-f6cd-47d3-9fda-a6409f9b73fd";
+
+    fn terminal(id: u32) -> PaneInfo {
+        PaneInfo { id, ..Default::default() }
+    }
+
+    fn live(pane: u32) -> Live {
+        let running = Running { pane, tool: Tool::Claude, args: vec![], cwd: "/w".into(), pane_pid: 1, command_pane: false };
+        Live { running, session_id: Some("11111111-2222-4333-8444-555555555555".into()), exact: true, pids: vec![], first_seen: 0 }
+    }
+
+    fn state(origin: Option<Origin>, saved: Option<Map>, tabs: &[u32]) -> State {
+        let mut state = State { origin, saved, exit_grace: EXIT_GRACE, ..Default::default() };
+        for (tab, count) in tabs.iter().enumerate() {
+            state.panes.insert(tab, (0..*count).map(|index| terminal(tab as u32 * 10 + index)).collect());
+        }
+        state
+    }
+
+    fn map(server: Option<&str>, shape: &[usize]) -> Map {
+        Map { format: MAP_FORMAT, panes: BTreeMap::new(), server: server.map(String::from), shape: shape.to_vec() }
+    }
+
+    #[test]
+    fn restores_only_what_another_server_left() {
+        let ours = Some(Origin { server: Some(SERVER.into()), layout: true });
+        // The plugin restarted in the running session that wrote the map.
+        assert!(!state(ours.clone(), Some(map(Some(SERVER), &[1])), &[1]).may_restore());
+        // A server before this one, or a map from before servers were recorded.
+        assert!(state(ours.clone(), Some(map(Some("another"), &[1])), &[1]).may_restore());
+        assert!(state(ours.clone(), Some(map(None, &[])), &[1]).may_restore());
+        // Not before knowing, nor without a map.
+        assert!(!state(None, Some(map(None, &[1])), &[1]).may_restore());
+        assert!(!state(ours, None, &[1]).may_restore());
+    }
+
+    #[test]
+    fn shells_only_in_a_resurrected_session_laid_out_as_the_map() {
+        let resurrected = Some(Origin { server: Some(SERVER.into()), layout: true });
+        let created = Some(Origin { server: Some(SERVER.into()), layout: false });
+        assert!(state(resurrected.clone(), Some(map(Some("before"), &[2, 1])), &[2, 1]).may_restore_shells());
+        assert!(!state(resurrected.clone(), Some(map(Some("before"), &[2, 1])), &[1]).may_restore_shells());
+        assert!(!state(resurrected.clone(), Some(map(None, &[])), &[1]).may_restore_shells()); // an older map: no shape
+        assert!(!state(created, Some(map(Some("before"), &[1])), &[1]).may_restore_shells()); // a new session, same name
+        assert!(!state(resurrected, Some(map(Some(SERVER), &[1])), &[1]).may_restore_shells());
+        assert!(!state(Some(Origin::default()), Some(map(Some("before"), &[1])), &[1]).may_restore_shells()); // unknown
+    }
+
+    #[test]
+    fn an_exited_cli_is_kept_for_a_while_then_dropped() {
+        let mut state = state(None, None, &[2]);
+        state.set_live(HashMap::from([(0, live(0)), (1, live(1))]));
+        state.set_live(HashMap::from([(1, live(1))])); // pane 0's CLI exited
+        assert!(state.ended.contains_key(&0) && !state.ended.contains_key(&1));
+        state.set_live(HashMap::from([(0, live(0)), (1, live(1))])); // and started again
+        assert!(state.ended.is_empty());
+        state.set_live(HashMap::new());
+        assert_eq!(state.ended.len(), 2);
+        state.panes.get_mut(&0).unwrap().retain(|pane| pane.id != 1); // pane 1 closed
+        state.set_live(HashMap::new());
+        assert_eq!(state.ended.keys().copied().collect::<Vec<_>>(), vec![0]);
+        state.exit_grace = Duration::ZERO; // time is up
+        state.set_live(HashMap::new());
+        assert!(state.ended.is_empty());
+    }
+
+    #[test]
+    fn origin_and_shells() {
+        assert_eq!(parse_origin(&format!("layout\nserver {SERVER}\n")), Origin { server: Some(SERVER.into()), layout: true });
+        assert_eq!(parse_origin("server ../../etc\n"), Origin::default());
+        assert_eq!(parse_origin(""), Origin::default());
+        assert!(is_shell("-zsh") && is_shell("/bin/bash") && is_shell("fish"));
+        assert!(!is_shell("claude") && !is_shell("/usr/bin/vim") && !is_shell("zsh-helper"));
+        let held = |command: &str| PaneInfo { id: 1, is_held: true, terminal_command: Some(command.into()), ..Default::default() };
+        assert!(holds_shell(&held("/bin/bash --norc")) && holds_shell(&held("-zsh")));
+        assert!(!holds_shell(&held("/bin/sh -c make watch")) && !holds_shell(&held("claude --resume x")));
+        assert!(!holds_shell(&PaneInfo { is_held: false, ..held("/bin/bash") }));
+        let mut panes = HashMap::new();
+        panes.insert(1, vec![terminal(3), PaneInfo { id: 9, is_plugin: true, ..Default::default() }]);
+        panes.insert(0, vec![terminal(1), terminal(2)]);
+        assert_eq!(shape(&panes), vec![2, 1]);
+        // Maps written before the server and shape were recorded still load.
+        let old: Map = serde_json::from_str(r#"{"format": 1, "panes": {}}"#).unwrap();
+        assert_eq!((old.server, old.shape), (None, vec![]));
     }
 
     #[test]
