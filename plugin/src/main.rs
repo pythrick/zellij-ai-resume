@@ -25,6 +25,13 @@
 //! title) as the tab's name while the tab has its default name. A resurrected
 //! tab gets "Tab #3" back as a name of its own, so its tab bar entry stops
 //! following the pane; once the session is restored, such tabs get new ones.
+//!
+//! It also follows what each agent is doing (see `agents`): an agent's tab is
+//! named after it with a mark ("◐ " working, "● " needs you, "✓ " finished
+//! and not seen yet), a key jumps to the agent that has waited longest, a
+//! second key opens a list of all of them (this plugin again, in a floating
+//! pane: the "inbox"), and a desktop notification says when one needs you or
+//! finishes while you look elsewhere.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -34,6 +41,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zellij_ai_resume::agents::{self, Activity};
 use zellij_ai_resume::cli::{self, Tool};
 use zellij_tile::prelude::*;
 
@@ -52,6 +60,31 @@ const MAP_FORMAT: u32 = 1;
 const MAP_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const PIPE_NAME: &str = "zjr-reload";
 const TABS_PIPE: &str = "zjr-tabs";
+/// What an agent's hook reports: "<pane id> blocked|done|working|idle".
+const STATUS_PIPE: &str = "zjr-status";
+/// Focus the agent that has waited longest for the user.
+const NEXT_PIPE: &str = "zjr-next";
+/// What the plugin needs: to read panes and tabs, run its scripts, type a
+/// command on reload, bind its keys, hear `zellij pipe`, change panes.
+const PERMISSIONS: [PermissionType; 6] = [
+    PermissionType::ReadApplicationState,
+    PermissionType::RunCommands,
+    PermissionType::WriteToStdin,
+    PermissionType::Reconfigure,
+    PermissionType::ReadCliPipes,
+    PermissionType::ChangeApplicationState,
+];
+/// And to read what agents draw, which came later. A background plugin
+/// cannot show Zellij's permission prompt, and asking it for a permission not
+/// granted yet holds its events back until someone answers; asking for fewer
+/// than granted makes Zellij forget the rest. So the grant pane (`zellij
+/// plugin -c grant=true -- ...`) asks for all of them and, granted, leaves
+/// SCREENS_GRANTED in the cache all instances share; from then on every
+/// instance asks for all of them.
+const READ_SCREENS: PermissionType = PermissionType::ReadPaneContents;
+const SCREENS_GRANTED: &str = "/cache/read-screens";
+/// At most one notification per agent and kind of news this often.
+const NOTIFY_EVERY: Duration = Duration::from_secs(30);
 /// Marks the commands that enter their directory themselves (see `command_in`).
 const MARKER: &str = "zellij-ai-resume";
 /// What an idle pane runs: a shell, which a restore may replace.
@@ -123,6 +156,16 @@ while [ -n "$dir" ] && [ "$dir" != / ]; do
 done
 "#;
 
+/// A desktop notification: title in $1, text in $2, both arguments (never
+/// code), through osascript on macOS or notify-send elsewhere.
+const NOTIFY: &str = r#"
+if command -v osascript >/dev/null 2>&1; then
+    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2"
+elif command -v notify-send >/dev/null 2>&1; then
+    notify-send --app-name=zellij-ai-resume "$1" "$2"
+fi
+"#;
+
 /// Which conversations still exist, and which Claude Code ones are open in a
 /// live process: `claude:<id>` / `codex:<id>` lines, then `live:<id>` lines.
 /// A registry entry counts only if its pid is still a Claude Code process: a
@@ -165,6 +208,9 @@ struct Map {
     /// Terminal panes per tab when it was written.
     #[serde(default)]
     shape: Vec<usize>,
+    /// The tabs (positions) this plugin names after their agent.
+    #[serde(default)]
+    owned_tabs: Vec<usize>,
 }
 
 /// What this server is, learned once at load (see ORIGIN).
@@ -202,6 +248,28 @@ struct Restore {
     tool: Tool,
     entry: Entry,
     shell: bool, // Zellij brought the pane back as a shell, not as the CLI waiting for Enter
+}
+
+/// What the plugin knows of what an agent is doing.
+#[derive(Clone, Debug)]
+struct Agent {
+    activity: Activity,
+    since: Instant,
+    since_epoch: u64,
+    idle_since: Option<Instant>, // looked idle in the middle of a turn since then
+    reported: Option<Activity>,  // what its hook said last: blocked, or done
+    notified: Option<(Activity, Instant)>,
+}
+
+/// An agent as the inbox lists it; the working instance writes them to /cache.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Row {
+    pane: u32,
+    tab: usize,
+    tool: String,
+    label: String,
+    activity: Activity,
+    since: u64,
 }
 
 #[derive(Debug)]
@@ -246,6 +314,25 @@ struct State {
     told: bool, // whether the restore decision has been logged
     bound: bool,
     notes: Vec<String>,
+    // Following the agents.
+    tab_status: bool,
+    notifications: bool,
+    next_key: String,
+    inbox_key: String,
+    agents: HashMap<u32, Agent>,
+    reports: HashMap<u32, Activity>, // from hooks, for agents not followed yet
+    tab_names: HashMap<usize, Vec<String>>, // tab id -> the names this plugin gave it, latest last
+    adopt: Option<HashSet<usize>>, // tab positions named by this plugin before it started
+    clients: usize,
+    rows_written: Option<String>,
+    last_notice: Option<Instant>,
+    screens: bool,     // reading pane contents is granted
+    ask_screens: bool, // and was asked for
+    // The inbox: this instance, opened by inbox_key, lists the agents.
+    inbox: bool,
+    rows: Vec<Row>,
+    selected: usize,
+    shown: bool,
 }
 
 register_plugin!(State);
@@ -255,6 +342,11 @@ impl ZellijPlugin for State {
         self.reload_key = configuration.get("reload_key").cloned().unwrap_or_else(|| "Alt r".to_string());
         self.exit_grace = EXIT_GRACE;
         self.tab_titles = configuration.get("tab_titles").map_or(true, |value| value.trim() != "false");
+        self.tab_status = configuration.get("tab_status").map_or(true, |value| value.trim() != "false");
+        self.notifications = configuration.get("notifications").map_or(true, |value| value.trim() != "false");
+        self.next_key = configuration.get("next_key").cloned().unwrap_or_else(|| "Alt u".to_string());
+        self.inbox_key = configuration.get("inbox_key").cloned().unwrap_or_else(|| "Alt a".to_string());
+        self.inbox = configuration.get("mode").map(String::as_str) == Some("inbox");
         if let Some(text) = configuration.get("exit_grace") {
             match text.trim().parse::<u64>() {
                 Ok(seconds) => self.exit_grace = Duration::from_secs(seconds),
@@ -262,14 +354,19 @@ impl ZellijPlugin for State {
             }
         }
         self.plugin_id = get_plugin_ids().plugin_id;
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::RunCommands,
-            PermissionType::WriteToStdin,
-            PermissionType::Reconfigure,
-            PermissionType::ReadCliPipes,
-            PermissionType::ChangeApplicationState,
-        ]);
+        self.ask_screens = configuration.get("grant").map(String::as_str) == Some("true") || fs::metadata(SCREENS_GRANTED).is_ok();
+        if self.ask_screens {
+            let mut all = PERMISSIONS.to_vec();
+            all.push(READ_SCREENS);
+            request_permission(&all);
+        } else {
+            request_permission(&PERMISSIONS);
+        }
+        if self.inbox {
+            subscribe(&[EventType::PermissionRequestResult, EventType::ModeUpdate, EventType::PaneUpdate, EventType::Key, EventType::Timer]);
+            set_timeout(0.1);
+            return;
+        }
         subscribe(&[
             EventType::PermissionRequestResult,
             EventType::ModeUpdate,
@@ -283,10 +380,17 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
+        if self.inbox {
+            return self.inbox_update(event);
+        }
         match event {
             Event::PermissionRequestResult(status) => {
                 self.granted = status == PermissionStatus::Granted;
                 self.note(format!("permissions {status:?}"));
+                self.screens = self.granted && self.ask_screens;
+                if self.screens && fs::metadata(SCREENS_GRANTED).is_err() {
+                    let _ = fs::write(SCREENS_GRANTED, "");
+                }
                 if self.granted {
                     // Granted here, in a pane: a background instance that asked
                     // before still waits for an answer; restarted, it finds the grant.
@@ -307,6 +411,7 @@ impl ZellijPlugin for State {
             Event::SessionUpdate(sessions, _) => {
                 if let Some(current) = sessions.iter().find(|session| session.is_current_session) {
                     self.session = Some(current.name.clone());
+                    self.clients = current.connected_clients;
                 }
             }
             Event::PaneUpdate(manifest) => self.panes = manifest.panes,
@@ -338,6 +443,10 @@ impl ZellijPlugin for State {
                         let origin = parse_origin(&output);
                         self.note(format!("server {}, {}", origin.server.as_deref().unwrap_or("(unknown)"),
                                           if origin.layout { "resurrected" } else { "not resurrected" }));
+                        if !self.screens {
+                            self.note("reading pane contents is not granted: Claude Code at work or waiting shows only once \
+                                       `zellij plugin -c grant=true -- <this plugin>` is run and answered y".to_string());
+                        }
                         self.origin = Some(origin);
                     }
                     _ => {}
@@ -352,7 +461,7 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
-        if message.name != PIPE_NAME && message.name != TABS_PIPE {
+        if self.inbox || ![PIPE_NAME, TABS_PIPE, STATUS_PIPE, NEXT_PIPE].contains(&message.name.as_str()) {
             return false;
         }
         if let PipeSource::Cli(pipe_id) = &message.source {
@@ -360,6 +469,27 @@ impl ZellijPlugin for State {
         }
         if message.name == TABS_PIPE {
             self.renew_tabs = true; // done at the next tick, once nothing is being restored
+            return false;
+        }
+        if message.name == NEXT_PIPE {
+            if self.granted && self.is_leader() {
+                self.next_agent();
+            }
+            return false;
+        }
+        if message.name == STATUS_PIPE {
+            let words: Vec<&str> = message.payload.as_deref().unwrap_or("").split_whitespace().collect();
+            if let [pane, event] = words[..] {
+                let activity = match event {
+                    "blocked" => Some(Activity::Blocked),
+                    "done" => Some(Activity::Done),
+                    "working" | "idle" => Some(Activity::Idle), // clears what was reported before
+                    _ => None,
+                };
+                if let (Ok(pane), Some(activity)) = (pane.strip_prefix("terminal_").unwrap_or(pane).parse::<u32>(), activity) {
+                    self.reports.insert(pane, activity);
+                }
+            }
             return false;
         }
         // `zellij pipe` with a non-terminal stdin (`! zellij pipe ...` inside
@@ -378,7 +508,10 @@ impl ZellijPlugin for State {
         true
     }
 
-    fn render(&mut self, _rows: usize, _cols: usize) {
+    fn render(&mut self, rows: usize, cols: usize) {
+        if self.inbox {
+            return self.render_inbox(rows, cols);
+        }
         // Seen only when the plugin is opened in a pane, e.g. to grant its permissions.
         println!("zellij-ai-resume");
         println!();
@@ -446,7 +579,8 @@ impl State {
             let count = self.saved.as_ref().map_or(0, |map| map.panes.len());
             self.note(format!("session {session}: {count} pane(s) saved before"));
             forget_old_maps();
-            self.bind_reload_key();
+            self.bind_keys();
+            self.adopt = Some(self.saved.as_ref().map(|saved| saved.owned_tabs.iter().copied().collect()).unwrap_or_default());
             let mut context = BTreeMap::new();
             context.insert("kind".to_string(), "origin".to_string());
             run_command_with_env_variables_and_cwd(&["/bin/sh", "-c", ORIGIN, "origin", &session], BTreeMap::new(),
@@ -473,27 +607,47 @@ impl State {
         if self.probe_sent.map_or(true, |sent| sent.elapsed() > STALE_COMMAND) {
             self.probe();
         }
+        if self.origin.is_some() && self.moving_until.map_or(true, |until| Instant::now() >= until) {
+            self.follow_agents();
+            if self.tab_status {
+                self.name_tabs();
+            }
+            self.write_rows(&session);
+        }
     }
 
-    /// Bind the reload key for this session (not written to the config file).
-    /// Through `reconfigure`: Zellij 0.45 drops a KeybindPipe's name and
-    /// payload when a plugin binds it with `rebind_keys`.
-    fn bind_reload_key(&mut self) {
-        if self.bound || self.reload_key.is_empty() {
+    /// Bind the plugin's keys for this session (not written to the config
+    /// file): reload, next agent, inbox. Through `reconfigure`: Zellij 0.45
+    /// drops a KeybindPipe's name and payload when a plugin binds it with
+    /// `rebind_keys`.
+    fn bind_keys(&mut self) {
+        if self.bound {
             return;
         }
-        let plain = self.reload_key.chars().all(|c| c.is_ascii_alphanumeric() || " +-".contains(c));
-        if !plain || KeyWithModifier::from_str(&self.reload_key).is_err() {
-            self.note(format!("reload_key {:?} is not a key", self.reload_key));
-            return;
+        let url = self.panes.values().flatten().find(|pane| pane.is_plugin && pane.id == self.plugin_id).and_then(|pane| pane.plugin_url.clone());
+        let kdl_string = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut binds = String::new();
+        for (setting, key, action) in [
+            ("reload_key", self.reload_key.clone(), format!("MessagePlugin {{ name \"{PIPE_NAME}\"; payload \"reload\"; }};")),
+            ("next_key", self.next_key.clone(), format!("MessagePlugin {{ name \"{NEXT_PIPE}\"; payload \"next\"; }};")),
+            ("inbox_key", self.inbox_key.clone(), match &url {
+                Some(url) => format!("LaunchOrFocusPlugin \"{}\" {{ floating true; move_to_focused_tab true; mode \"inbox\"; }};", kdl_string(url)),
+                None => String::new(),
+            }),
+        ] {
+            if key.is_empty() || action.is_empty() {
+                continue;
+            }
+            let plain = key.chars().all(|c| c.is_ascii_alphanumeric() || " +-".contains(c));
+            if !plain || KeyWithModifier::from_str(&key).is_err() {
+                self.note(format!("{setting} {key:?} is not a key"));
+                continue;
+            }
+            binds.push_str(&format!("        bind \"{key}\" {{ {action} }}\n"));
         }
-        reconfigure(
-            format!(
-                "keybinds {{\n    shared_except \"locked\" {{\n        bind \"{}\" {{ MessagePlugin {{ name \"{PIPE_NAME}\"; payload \"reload\"; }}; }}\n    }}\n}}\n",
-                self.reload_key
-            ),
-            false,
-        );
+        if !binds.is_empty() {
+            reconfigure(format!("keybinds {{\n    shared_except \"locked\" {{\n{binds}    }}\n}}\n"), false);
+        }
         self.bound = true;
     }
 
@@ -635,6 +789,279 @@ impl State {
         self.moving_until = Some(Instant::now() + MOVE_SETTLE);
         self.save_after_move = true;
         self.note(format!("{} tab(s) show their pane's title again", moving.len()));
+    }
+
+    // --- following the agents -----------------------------------------------------------
+
+    /// Follow what each CLI is doing, from its pane's title and the bottom of
+    /// its screen, and from what its hooks reported (`zellij pipe --name
+    /// zjr-status`). A turn that ends while the user looks elsewhere is
+    /// `Done` until they look; becoming `Blocked` or `Done` that way is news.
+    fn follow_agents(&mut self) {
+        let focused = if self.clients > 0 { self.focused_pane() } else { None };
+        // CLIs coming back in a resurrected session are no news.
+        let quiet = self.restoring() && self.may_restore() && self.saved.as_ref().map_or(false, |saved| !saved.panes.is_empty());
+        let now = Instant::now();
+        let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+        let ids: Vec<u32> = self.live.keys().copied().collect();
+        self.agents.retain(|id, _| ids.contains(id));
+        let panes: HashSet<u32> = self.panes.values().flatten().filter(|pane| !pane.is_plugin).map(|pane| pane.id).collect();
+        self.reports.retain(|pane, _| panes.contains(pane));
+        let mut news = Vec::new();
+        // Zellij answers a screen read from its screen thread, and may take a
+        // while when that is busy: past a second in a tick, the rest wait.
+        let reading = Instant::now();
+        for id in ids {
+            if self.screens && reading.elapsed() > Duration::from_secs(1) {
+                break;
+            }
+            let tool = self.live[&id].running.tool;
+            let Some(title) = self.panes.values().flatten().find(|pane| !pane.is_plugin && pane.id == id).map(|pane| pane.title.clone()) else {
+                continue;
+            };
+            let screen = if self.screens {
+                get_pane_scrollback(PaneId::Terminal(id), false).map(|contents| contents.viewport).unwrap_or_default()
+            } else {
+                vec![]
+            };
+            let mut seen = agents::detect(tool, &title, &screen);
+            let report = self.reports.remove(&id);
+            let agent = self.agents.entry(id).or_insert(Agent {
+                activity: Activity::Idle, since: now, since_epoch: epoch, idle_since: None, reported: None, notified: None,
+            });
+            if let Some(report) = report {
+                agent.reported = (report != Activity::Idle).then_some(report);
+            }
+            if seen == Activity::Working && agent.reported == Some(Activity::Blocked) {
+                agent.reported = None; // answered
+            }
+            if agent.reported == Some(Activity::Blocked) {
+                seen = Activity::Blocked;
+            }
+            let finished = agent.reported == Some(Activity::Done);
+            if finished {
+                agent.reported = None;
+            }
+            let here = focused == Some(id);
+            let (next, idle_since) = agents::advance(agent.activity, seen, finished, here, agent.idle_since, now);
+            agent.idle_since = idle_since;
+            if next != agent.activity {
+                agent.activity = next;
+                agent.since = now;
+                agent.since_epoch = epoch;
+                if matches!(next, Activity::Blocked | Activity::Done) && !here && !quiet {
+                    news.push(id);
+                }
+            }
+        }
+        for id in news {
+            self.notify(id);
+        }
+    }
+
+    /// What to call an agent: its CLI's title, else the CLI and its folder.
+    fn label_of(&self, pane: u32) -> String {
+        let Some(live) = self.live.get(&pane) else { return String::new() };
+        let title = self.panes.values().flatten().find(|info| !info.is_plugin && info.id == pane).map_or("", |info| info.title.as_str());
+        let label = agents::label(live.running.tool, title);
+        if label.is_empty() {
+            let folder = live.running.cwd.rsplit('/').next().unwrap_or("");
+            format!("{} · {folder}", live.running.tool.name())
+        } else {
+            label
+        }
+    }
+
+    /// Name each agent's tab after it, with a mark for what it does (see
+    /// `Activity::glyph`), the most pressing agent first when a tab has
+    /// several. Only tabs that keep a name Zellij gave them, or one this
+    /// plugin gave them: a tab the user renamed is theirs.
+    fn name_tabs(&mut self) {
+        let adopt = self.adopt.take().unwrap_or_default();
+        for tab in self.tabs.clone() {
+            let panes: Vec<PaneInfo> = self.panes.get(&tab.position).map_or(vec![], |panes| {
+                panes.iter().filter(|pane| !pane.is_plugin && !pane.is_suppressed).cloned().collect()
+            });
+            let ours = match self.tab_names.get(&tab.tab_id) {
+                Some(names) => names.contains(&tab.name),
+                None => is_default_tab_name(&tab.name) || (panes.len() == 1 && tab.name == panes[0].title) || adopt.contains(&tab.position),
+            };
+            if !ours {
+                self.tab_names.remove(&tab.tab_id);
+                continue;
+            }
+            let focused = panes.iter().find(|pane| pane.is_focused).map(|pane| pane.id);
+            let best = panes.iter().filter_map(|pane| self.agents.get(&pane.id).map(|agent| (pane.id, agent.activity)))
+                .max_by_key(|(pane, activity)| (activity.urgency(), Some(*pane) == focused));
+            let name = match best {
+                Some((pane, activity)) => format!("{}{}", activity.glyph(), self.label_of(pane)),
+                None => match self.tab_names.get(&tab.tab_id).and_then(|names| names.last()) {
+                    Some(name) => strip_mark(name).to_string(), // its agent is gone: no mark any more
+                    None if adopt.contains(&tab.position) => tab.name.clone(), // named before; its agent comes back soon
+                    None => continue, // Zellij's to name
+                },
+            };
+            if name.is_empty() {
+                continue;
+            }
+            if name != tab.name {
+                rename_tab_with_id(tab.tab_id as u64, &name);
+            }
+            let names = self.tab_names.entry(tab.tab_id).or_default();
+            if names.last() != Some(&name) {
+                names.push(name);
+                if names.len() > 4 {
+                    names.remove(0); // a few, for renames Zellij has not reported back yet
+                }
+            }
+        }
+        let tab_ids: HashSet<usize> = self.tabs.iter().map(|tab| tab.tab_id).collect();
+        self.tab_names.retain(|id, _| tab_ids.contains(id));
+    }
+
+    /// Focus the agent that has waited longest for the user: one that needs
+    /// an answer, else one that finished.
+    fn next_agent(&mut self) {
+        let focused = self.focused_pane();
+        let next = self.agents.iter()
+            .filter(|(pane, agent)| Some(**pane) != focused && matches!(agent.activity, Activity::Blocked | Activity::Done))
+            .max_by_key(|(_, agent)| (agent.activity.urgency(), std::cmp::Reverse(agent.since)))
+            .map(|(pane, _)| *pane);
+        match next {
+            Some(pane) => focus_terminal_pane(pane, false, false),
+            None => self.note("next: no agent waits for you".to_string()),
+        }
+    }
+
+    /// Tell the desktop that an agent needs the user or finished.
+    fn notify(&mut self, pane: u32) {
+        let Some(agent) = self.agents.get(&pane) else { return };
+        let activity = agent.activity;
+        let repeated = agent.notified.map_or(false, |(was, at)| was == activity && at.elapsed() < NOTIFY_EVERY);
+        if !self.notifications || repeated || self.last_notice.map_or(false, |at| at.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        let Some(live) = self.live.get(&pane) else { return };
+        let tab = self.panes.iter().find(|(_, panes)| panes.iter().any(|info| !info.is_plugin && info.id == pane)).map(|(tab, _)| *tab);
+        let tool = match live.running.tool {
+            Tool::Claude => "Claude Code",
+            Tool::Codex => "Codex",
+        };
+        let title = match tab {
+            Some(tab) => format!("{tool} · tab {}", tab + 1),
+            None => tool.to_string(),
+        };
+        let text = format!("{}: {}", self.label_of(pane), activity.describe());
+        let clean = |text: String| -> String { text.chars().filter(|c| !c.is_control()).collect() };
+        run(&["/bin/sh".to_string(), "-c".to_string(), NOTIFY.to_string(), "notify".to_string(), clean(title), clean(text)], "notify");
+        self.last_notice = Some(Instant::now());
+        if let Some(agent) = self.agents.get_mut(&pane) {
+            agent.notified = Some((activity, Instant::now()));
+        }
+    }
+
+    /// The agents as the inbox lists them, written when they change.
+    fn write_rows(&mut self, session: &str) {
+        let mut rows: Vec<Row> = self.agents.iter().filter_map(|(pane, agent)| {
+            let tab = self.panes.iter().find(|(_, panes)| panes.iter().any(|info| !info.is_plugin && info.id == *pane)).map(|(tab, _)| *tab)?;
+            let tool = self.live.get(pane)?.running.tool.name().to_string();
+            Some(Row { pane: *pane, tab, tool, label: self.label_of(*pane), activity: agent.activity, since: agent.since_epoch })
+        }).collect();
+        rows.sort_by_key(|row| (std::cmp::Reverse(row.activity.urgency()), row.since, row.tab));
+        let Ok(text) = serde_json::to_string(&rows) else { return };
+        if self.rows_written.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let path = rows_path(session);
+        let temporary = path.with_extension("tmp");
+        if fs::write(&temporary, &text).and_then(|_| fs::rename(&temporary, &path)).is_ok() {
+            self.rows_written = Some(text);
+        }
+    }
+
+    // --- the inbox ----------------------------------------------------------------------
+
+    fn inbox_update(&mut self, event: Event) -> bool {
+        match event {
+            Event::PermissionRequestResult(status) => {
+                self.granted = status == PermissionStatus::Granted;
+                if self.granted {
+                    rename_plugin_pane(self.plugin_id, "Agents");
+                }
+            }
+            Event::ModeUpdate(info) => {
+                if info.session_name.is_some() {
+                    self.session = info.session_name;
+                }
+            }
+            Event::PaneUpdate(manifest) => {
+                // Closed when left (or when brought back by a resurrection, unseen).
+                let me = manifest.panes.values().flatten().find(|pane| pane.is_plugin && pane.id == self.plugin_id).cloned();
+                match me {
+                    Some(pane) if pane.is_focused => self.shown = true,
+                    Some(_) if self.shown => close_self(),
+                    _ => {}
+                }
+                self.panes = manifest.panes;
+            }
+            Event::Timer(_) => {
+                if !self.shown && self.loaded.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
+                    close_self();
+                }
+                if let Some(session) = &self.session {
+                    let rows: Vec<Row> = fs::read_to_string(rows_path(session)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+                    self.rows = rows;
+                    self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+                }
+                set_timeout(1.0);
+            }
+            Event::Key(key) => {
+                let pick = |state: &mut State, index: usize| {
+                    if let Some(row) = state.rows.get(index) {
+                        focus_terminal_pane(row.pane, false, false);
+                        close_self();
+                    }
+                };
+                match key.bare_key {
+                    BareKey::Down | BareKey::Char('j') if key.has_no_modifiers() => {
+                        self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
+                    }
+                    BareKey::Up | BareKey::Char('k') if key.has_no_modifiers() => self.selected = self.selected.saturating_sub(1),
+                    BareKey::Enter => {
+                        let index = self.selected;
+                        pick(self, index);
+                    }
+                    BareKey::Char(digit @ '1'..='9') if key.has_no_modifiers() => pick(self, digit as usize - '1' as usize),
+                    BareKey::Esc | BareKey::Char('q') => close_self(),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn render_inbox(&mut self, rows: usize, cols: usize) {
+        let fit = |text: String| -> String { text.chars().take(cols).collect() };
+        println!("{}", fit(format!("Agents  {}", "↑↓ select · Enter go · 1-9 go · Esc close")));
+        println!();
+        if self.rows.is_empty() {
+            println!("{}", fit("No Claude Code or Codex in this session.".to_string()));
+            return;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+        for (index, row) in self.rows.iter().enumerate().take(rows.saturating_sub(2)) {
+            let mark = row.activity.glyph();
+            let mark = if mark.is_empty() { "  " } else { mark };
+            let line = format!("{} {}{mark}tab {:<3} {:<6} {}  ({}, {})", if index < 9 { (index + 1).to_string() } else { " ".to_string() },
+                               if index == self.selected { "▸ " } else { "  " }, row.tab + 1, row.tool, row.label, row.activity.describe(),
+                               ago(now.saturating_sub(row.since)));
+            if index == self.selected {
+                println!("\u{1b}[7m{}\u{1b}[0m", fit(line));
+            } else {
+                println!("{}", fit(line));
+            }
+        }
     }
 
     // --- following the CLIs -------------------------------------------------------------
@@ -831,7 +1258,10 @@ impl State {
             }
         }
         let gained = panes.iter().any(|(key, entry)| self.written_panes.get(key) != Some(entry));
-        let map = Map { format: MAP_FORMAT, panes, server, shape: shape(&self.panes) };
+        let owned_tabs: Vec<usize> = self.tabs.iter()
+            .filter(|tab| self.tab_names.get(&tab.tab_id).and_then(|names| names.last()) == Some(&tab.name))
+            .map(|tab| tab.position).collect();
+        let map = Map { format: MAP_FORMAT, panes, server, shape: shape(&self.panes), owned_tabs };
         let moved = map.shape != self.written_shape;
         let Ok(text) = serde_json::to_string_pretty(&map) else { return };
         if std::mem::take(&mut self.save_after_move) {
@@ -1009,10 +1439,34 @@ fn signal(pids: &[i32], name: &str) {
     run(&command, "signal");
 }
 
+/// "Tab #3": the name Zellij gives a tab (and a resurrection gives back).
+fn is_default_tab_name(name: &str) -> bool {
+    name.strip_prefix("Tab #").map_or(false, |n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A tab name without the mark this plugin puts before it.
+fn strip_mark(name: &str) -> &str {
+    [Activity::Working, Activity::Blocked, Activity::Done].iter().find_map(|activity| name.strip_prefix(activity.glyph())).unwrap_or(name)
+}
+
+/// "12s", "5m", "3h", "2d".
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86400),
+    }
+}
+
+fn rows_path(session: &str) -> PathBuf {
+    map_path(session).with_file_name(format!("agents-{}", map_path(session).file_name().map_or(String::new(), |name| name.to_string_lossy().trim_start_matches("session-").to_string())))
+}
+
 /// The pane of a tab that Zellij would name after it: a tab still called by
 /// a default name, with one tiled terminal pane and no other pane to select.
 fn lone_pane(tab: &TabInfo, panes: &[PaneInfo]) -> Option<u32> {
-    let default_name = tab.name.strip_prefix("Tab #").map_or(false, |n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let default_name = is_default_tab_name(&tab.name);
     let mut terminals = panes.iter().filter(|pane| !pane.is_plugin && !pane.is_suppressed);
     let pane = terminals.next()?;
     let alone = terminals.next().is_none() && panes.iter().all(|other| !other.is_plugin || !other.is_selectable || other.is_suppressed);
@@ -1241,7 +1695,7 @@ mod tests {
     }
 
     fn map(server: Option<&str>, shape: &[usize]) -> Map {
-        Map { format: MAP_FORMAT, panes: BTreeMap::new(), server: server.map(String::from), shape: shape.to_vec() }
+        Map { format: MAP_FORMAT, panes: BTreeMap::new(), server: server.map(String::from), shape: shape.to_vec(), owned_tabs: vec![] }
     }
 
     #[test]
@@ -1323,6 +1777,18 @@ mod tests {
         assert_eq!(lone_pane(&tab("Tab #3"), &[terminal(3), grant]), None);
         let background = PaneInfo { id: 0, is_plugin: true, is_selectable: true, is_suppressed: true, ..Default::default() };
         assert_eq!(lone_pane(&tab("Tab #1"), &[terminal(3), bar, background]), Some(3));
+    }
+
+    #[test]
+    fn tab_names_and_marks() {
+        assert!(is_default_tab_name("Tab #3") && is_default_tab_name("Tab #14"));
+        assert!(!is_default_tab_name("Tab #") && !is_default_tab_name("work") && !is_default_tab_name("Tab #3 x"));
+        assert_eq!(strip_mark("◐ Fixing bugs"), "Fixing bugs");
+        assert_eq!(strip_mark("● Fixing bugs"), "Fixing bugs");
+        assert_eq!(strip_mark("✓ Fixing bugs"), "Fixing bugs");
+        assert_eq!(strip_mark("Fixing bugs"), "Fixing bugs");
+        assert_eq!((ago(5), ago(125), ago(7300), ago(200000)), ("5s".into(), "2m".into(), "2h".into(), "2d".into()));
+        assert_eq!(rows_path("llm"), PathBuf::from("/cache/agents-llm.json"));
     }
 
     #[test]

@@ -11,12 +11,15 @@ NAME=zellij-ai-resume.wasm
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--wasm FILE] [--config-dir DIR] [--edit-config]
+Usage: ./install.sh [--wasm FILE] [--config-dir DIR] [--edit-config] [--claude-hooks]
 
   --wasm FILE       install this build of the plugin instead of building one
                     (needs Rust through rustup: https://rustup.rs)
   --config-dir DIR  Zellij's configuration directory (default: the one Zellij
                     uses, as `zellij setup --check` reports it)
+  --claude-hooks    also add hooks to Claude Code's settings.json that tell the
+                    plugin at once when Claude needs you or finishes (it reads
+                    the screen otherwise), keeping a copy of the file as it was
   --edit-config     add the plugin to load_plugins in config.kdl, keeping a
                     copy of the file as it was (default: print what to add)
 EOF
@@ -30,6 +33,7 @@ die() {
 wasm=
 config_dir=
 edit=false
+hooks=false
 while [ $# -gt 0 ]; do
     case $1 in
         --wasm) [ $# -ge 2 ] || die "--wasm needs a file"; wasm=$2; shift 2 ;;
@@ -37,6 +41,7 @@ while [ $# -gt 0 ]; do
         --config-dir) [ $# -ge 2 ] || die "--config-dir needs a directory"; config_dir=$2; shift 2 ;;
         --config-dir=*) config_dir=${1#--config-dir=}; shift ;;
         --edit-config) edit=true; shift ;;
+        --claude-hooks) hooks=true; shift ;;
         -h | --help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -147,13 +152,67 @@ else
     fi
 fi
 
+if $hooks; then
+    # Claude Code hooks that report to the plugin through `zellij pipe`.
+    # Each does nothing outside Zellij, prints nothing (a UserPromptSubmit
+    # hook's output would reach Claude) and always succeeds.
+    settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+    command -v python3 >/dev/null 2>&1 || die "--claude-hooks needs python3 to edit $settings"
+    [ ! -L "$settings" ] || die "$settings is a symbolic link (managed dotfiles?): add the hooks from the README to its source"
+    python3 - "$settings" <<'PY' || die "could not add the hooks to $settings"
+import json, os, shutil, sys
+
+path = sys.argv[1]
+def report(event):
+    return ('[ -n "$ZELLIJ_PANE_ID" ] && zellij pipe --name zjr-status -- "$ZELLIJ_PANE_ID ' + event
+            + '" </dev/null >/dev/null 2>&1; exit 0')
+wanted = {
+    # Only permission prompts and questions, not "still waiting" reminders.
+    "Notification": 'case "$(cat)" in *permission_prompt*|*elicitation_dialog*) ;; *) exit 0 ;; esac; ' + report("blocked"),
+    "Stop": report("done"),
+    "UserPromptSubmit": report("working"),
+}
+settings = {}
+if os.path.exists(path):
+    with open(path) as handle:
+        text = handle.read()
+    settings = json.loads(text) if text.strip() else {}
+    if not isinstance(settings, dict):
+        sys.exit(f"{path} is not a JSON object")
+hooks = settings.setdefault("hooks", {})
+added = []
+for event, command in wanted.items():
+    groups = hooks.setdefault(event, [])
+    if any("zjr-status" in hook.get("command", "") for group in groups for hook in group.get("hooks", [])):
+        continue
+    groups.append({"hooks": [{"type": "command", "command": command}]})
+    added.append(event)
+if not added:
+    print(f"{path} already has the hooks")
+    sys.exit(0)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+if os.path.exists(path):
+    shutil.copy2(path, path + ".before-zellij-ai-resume")
+temporary = path + ".zellij-ai-resume"
+with open(temporary, "w") as handle:
+    json.dump(settings, handle, indent=2)
+    handle.write("\n")
+if os.path.exists(path):
+    shutil.copymode(path, temporary)
+os.replace(temporary, path)
+print(f"Added hooks ({', '.join(added)}) to {path}" + (f" (the file as it was: {path}.before-zellij-ai-resume)" if os.path.exists(path + ".before-zellij-ai-resume") else ""))
+PY
+fi
+
 cat <<EOF
 
 Then, once, inside Zellij, grant the plugin its permissions:
 
-    zellij plugin -- '$url'
+    zellij plugin -c grant=true -- '$url'
 
 and press y in the pane that opens (then close it). Sessions started or
 resurrected from then on bring each Claude Code and Codex pane back on its
-conversation; Alt r restarts the focused one in place.
+conversation, and name each one's tab after what it does. Alt r restarts the
+focused one in place, Alt u goes to the one waiting longest for you, Alt a
+lists them all.
 EOF

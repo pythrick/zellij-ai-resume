@@ -1,7 +1,8 @@
 #!/bin/sh
 # uninstall.sh: remove what install.sh installed. --edit-config also takes
-# the plugin's line out of config.kdl (otherwise it says which line to
-# remove); --purge also deletes the saved pane maps.
+# the plugin's line out of config.kdl and its hooks out of Claude Code's
+# settings.json (otherwise it says what to remove); --purge also deletes the
+# saved pane maps.
 #
 # Sessions resurrected afterwards still come back, with each pane's command
 # waiting for Enter as Zellij does by default.
@@ -76,10 +77,47 @@ elif [ -f "$config_file" ] && grep -q "$NAME" "$config_file"; then
     grep -n "$NAME" "$config_file"
 fi
 
+# Claude Code hooks added by install.sh --claude-hooks (they report to the
+# plugin, and do nothing without it).
+settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+if [ -f "$settings" ] && grep -q 'zjr-status' "$settings"; then
+    if $edit && [ ! -L "$settings" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$settings" <<'PY' && echo "removed the zellij-ai-resume hooks from $settings (the file as it was: $settings.before-zellij-ai-resume-uninstall)"
+import json, os, shutil, sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    settings = json.load(handle)
+hooks = settings.get("hooks", {})
+for event in list(hooks):
+    groups = []
+    for group in hooks[event]:
+        kept = [hook for hook in group.get("hooks", []) if "zjr-status" not in hook.get("command", "")]
+        if kept:
+            groups.append(dict(group, hooks=kept))
+    if groups:
+        hooks[event] = groups
+    else:
+        del hooks[event]
+if not hooks:
+    settings.pop("hooks", None)
+shutil.copy2(path, path + ".before-zellij-ai-resume-uninstall")
+temporary = path + ".zellij-ai-resume"
+with open(temporary, "w") as handle:
+    json.dump(settings, handle, indent=2)
+    handle.write("\n")
+shutil.copymode(path, temporary)
+os.replace(temporary, path)
+PY
+    else
+        echo "$settings has zellij-ai-resume hooks (commands with zjr-status): --edit-config removes them"
+    fi
+fi
+
 if $purge && [ -n "$cache_dir" ] && [ -d "$cache_dir" ]; then
     # The plugin's own cache folder, where it keeps one map per session.
     find "$cache_dir" -type d -name plugin_cache -path "*$NAME*" 2>/dev/null | while IFS= read -r dir; do
-        rm -f -- "$dir"/session-*.json
+        rm -f -- "$dir"/session-*.json "$dir"/agents-*.json
         echo "removed the saved pane maps in $dir"
     done
 fi

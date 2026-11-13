@@ -15,6 +15,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -31,7 +32,8 @@ WASM = os.environ.get("ZJR_PLUGIN_WASM") or os.path.join(PLUGIN, "target", "wasm
                                                           "zellij-ai-resume.wasm")
 SESSION = "zjr-plugin"
 URL = "file:~/.config/zellij/plugins/zellij-ai-resume.wasm"  # what install.sh writes and prints
-PERMISSIONS = ("ReadApplicationState", "RunCommands", "WriteToStdin", "Reconfigure", "ReadCliPipes", "ChangeApplicationState")
+PERMISSIONS = ("ReadApplicationState", "RunCommands", "WriteToStdin", "Reconfigure", "ReadCliPipes", "ChangeApplicationState",
+               "ReadPaneContents")
 
 
 @unittest.skipUnless(os.environ.get("ZJR_E2E") == "1" and ZELLIJ, "set ZJR_E2E=1 (needs zellij)")
@@ -64,13 +66,24 @@ class PluginTest(unittest.TestCase):
         installed = subprocess.run(["/bin/sh", os.path.join(ROOT, "install.sh"), "--wasm", WASM, "--edit-config"],
                                    env=self.env, capture_output=True, text=True)
         self.assertEqual(installed.returncode, 0, installed.stderr)
-        self.assertIn(f"zellij plugin -- '{URL}'", installed.stdout)
-        # The one-time grant (`zellij plugin -- ...`, then y), as Zellij caches it.
-        grant = f'"{config_dir}/plugins/zellij-ai-resume.wasm" {{\n' + "".join(f"    {name}\n" for name in PERMISSIONS) + "}\n"
+        self.assertIn(f"zellij plugin -c grant=true -- '{URL}'", installed.stdout)
+        self.grant(PERMISSIONS)
+
+    def grant(self, permissions):
+        """The one-time grant (`zellij plugin -c grant=true -- ...`, then y), as Zellij caches it."""
+        wasm = os.path.join(self.box.home, ".config", "zellij", "plugins", "zellij-ai-resume.wasm")
+        grant = f'"{wasm}" {{\n' + "".join(f"    {name}\n" for name in permissions) + "}\n"
         for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):
-            os.makedirs(os.path.join(home, cache), exist_ok=True)
-            with open(os.path.join(home, cache, "permissions.kdl"), "w") as handle:
+            os.makedirs(os.path.join(self.box.home, cache), exist_ok=True)
+            with open(os.path.join(self.box.home, cache, "permissions.kdl"), "w") as handle:
                 handle.write(grant)
+            # and the plugin's own note of it, in its /cache
+            marker = os.path.join(self.box.home, cache) + "/file:" + wasm + "/plugin_cache/read-screens"
+            if "ReadPaneContents" in permissions:
+                os.makedirs(os.path.dirname(marker), exist_ok=True)
+                open(marker, "w").close()
+            elif os.path.exists(marker):
+                os.unlink(marker)
         self.clients = []
         self.addCleanup(self.cleanup)
 
@@ -355,6 +368,22 @@ class Resurrection(PluginTest):
 
 
 class Upgrade(PluginTest):
+    def test_without_reading_pane_contents_all_else_works(self):
+        # Granted before the plugin read screens: it must not ask a background
+        # plugin for more (that would hold its events back until answered).
+        self.grant(PERMISSIONS[:-1])
+        self.start(FAKE_SCREEN=1, FAKE_TITLE="Old grant", FAKE_WORK_AFTER=6, FAKE_WORK_FOR=30)
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        session = self.box.wait_event(event="start", timeout=15)["session"]
+        self.recorded(session)
+        wait_for(lambda: Agents.tab_names(self)[0] == "Old grant", timeout=15, interval=0.5, what="the tab named after the agent")
+        self.box.wait_event(event="screen", state="working", timeout=20)
+        time.sleep(5)
+        self.assertEqual(Agents.tab_names(self)[0], "Old grant")  # no screens read: working is not seen
+        self.crash_and_attach()
+        resumed = self.box.wait_event(event="start", skip=1, timeout=20)
+        self.assertEqual(resumed["argv"][:2], ["--resume", session])
+
     def test_restarting_the_plugin_in_a_running_session_changes_no_pane(self):
         # `zellij action start-or-reload-plugin`, as after reinstalling: the
         # plugin starts again in the session that wrote its map. A CLI quit
@@ -443,6 +472,7 @@ class TabTitles(PluginTest):
     def test_a_session_whose_tabs_were_moved_comes_back_right(self):
         # Resurrected, the tabs move to new ones (new ids, by the plugin);
         # the next resurrection must still find each CLI at its position.
+        self.configure(tab_status="false")  # agent tabs are named by the plugin otherwise, and need no move
         self.start()
         self.three_tabs()
         for index, pane in enumerate(sorted(p["id"] for p in self.terminals())):
@@ -467,6 +497,127 @@ class TabTitles(PluginTest):
         self.assertEqual(len(self.terminals()), 3)
         wait_for(lambda: model_at() == {"0:0": "m0", "1:0": "m1", "2:0": "m2"}, timeout=10, what="each at its position")
 
+class Agents(PluginTest):
+    # What each agent does, on its tab, by notification, with a key to jump
+    # and a list of all. The fake Claude draws what Claude Code draws.
+
+    def setUp(self):
+        super().setUp()
+        self.notices = os.path.join(self.box.dir, "notices.log")
+        for name in ("osascript", "notify-send"):  # never a real notification
+            path = os.path.join(self.box.fakes, name)
+            with open(path, "w") as handle:
+                handle.write(f'#!/bin/sh\nn=$#\neval "title=\\${{$((n - 1))}} text=\\${{$n}}"\n'
+                             f'printf "%s|%s\\n" "$title" "$text" >> {self.notices}\n')
+            os.chmod(path, 0o755)
+
+    def tab_names(self):
+        return [re.split(r"\s{2,}", line.strip())[2] for line in self.action("list-tabs").strip().splitlines()[1:]]
+
+    def focused_tab(self):
+        lines = self.action("list-tabs", "--state").strip().splitlines()[1:]
+        return next((index for index, line in enumerate(lines) if re.split(r"\s{2,}", line.strip())[3] == "true"), None)
+
+    def notified(self):
+        try:
+            with open(self.notices) as handle:
+                return handle.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def claude_in_first_tab(self, **fake):
+        client = self.start(FAKE_SCREEN=1, **fake)
+        pane = self.terminals()[0]["id"]
+        self.type(pane, "claude --verbose")
+        self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
+        return client, pane
+
+    def elsewhere(self):
+        self.action("new-tab", "--cwd", self.box.work)  # and focused there
+        wait_for(lambda: self.focused_tab() == 1, interval=0.5, what="the second tab focused")
+
+    def test_a_tab_shows_what_its_agent_does(self):
+        self.claude_in_first_tab(FAKE_TITLE="Fixing bugs", FAKE_WORK_AFTER=8, FAKE_WORK_FOR=6)
+        wait_for(lambda: self.tab_names()[0] == "Fixing bugs", timeout=15, interval=0.5, what="the tab named after the agent")
+        wait_for(lambda: self.tab_names()[0] == "◐ Fixing bugs", timeout=15, interval=0.5, what="working")
+        self.elsewhere()
+        wait_for(lambda: self.tab_names()[0] == "✓ Fixing bugs", timeout=20, interval=0.5, what="finished, not seen")
+        wait_for(lambda: "Claude Code · tab 1|Fixing bugs: finished" in self.notified(), timeout=10, what="a notification")
+        self.action("go-to-tab", "1")
+        wait_for(lambda: self.tab_names()[0] == "Fixing bugs", timeout=10, interval=0.5, what="seen")
+
+    def test_waiting_for_you_and_the_key_that_goes_there(self):
+        client, pane = self.claude_in_first_tab(FAKE_TITLE="Needs a yes", FAKE_ASK_AFTER=10)
+        self.elsewhere()
+        wait_for(lambda: self.tab_names()[0] == "● Needs a yes", timeout=25, interval=0.5, what="needs you")
+        wait_for(lambda: "Claude Code · tab 1|Needs a yes: needs you" in self.notified(), timeout=10, what="a notification")
+        os.write(client.master, b"\x1bu")  # Alt u
+        wait_for(lambda: self.focused_tab() == 0, timeout=10, interval=0.5, what="Alt u to go to it")
+        self.assertEqual(self.tab_names()[0], "● Needs a yes")  # still waiting for the answer
+
+    def test_the_inbox_lists_the_agents_and_goes_to_one(self):
+        client, pane = self.claude_in_first_tab(FAKE_TITLE="Inbox me", FAKE_ASK_AFTER=8)
+        self.elsewhere()
+        wait_for(lambda: self.tab_names()[0] == "● Inbox me", timeout=25, interval=0.5, what="needs you")
+        since = len(client.output)
+        os.write(client.master, b"\x1ba")  # Alt a
+        inbox = lambda: [p for p in json.loads(self.action("list-panes", "--json", "--all") or "[]")
+                         if p["is_plugin"] and p.get("is_floating") and "zellij-ai-resume" in (p.get("plugin_url") or "")]
+        wait_for(inbox, timeout=10, interval=0.5, what="the inbox")
+        wait_for(lambda: b"needs you" in client.output[since:] and b"Inbox me" in client.output[since:], timeout=10,
+                 what="the inbox to list the agent")
+        os.write(client.master, b"1")
+        wait_for(lambda: self.focused_tab() == 0, timeout=10, interval=0.5, what="1 to go to the first agent")
+        wait_for(lambda: not inbox(), timeout=10, interval=0.5, what="the inbox to close")
+
+    def test_hooks_report_through_zellij_pipe(self):
+        client, pane = self.claude_in_first_tab(FAKE_TITLE="Hooked")
+        self.elsewhere()
+        wait_for(lambda: self.tab_names()[0] == "Hooked", timeout=15, interval=0.5, what="named")
+        report = lambda event: self.zellij("--session", SESSION, "pipe", "--name", "zjr-status", "--", f"{pane} {event}")
+        report("blocked")
+        wait_for(lambda: self.tab_names()[0] == "● Hooked", timeout=10, interval=0.5, what="blocked, as reported")
+        report("idle")
+        wait_for(lambda: self.tab_names()[0] == "Hooked", timeout=10, interval=0.5, what="cleared")
+        report("done")
+        wait_for(lambda: self.tab_names()[0] == "✓ Hooked", timeout=10, interval=0.5, what="done, as reported")
+
+    def test_the_claude_code_hooks_install_sh_adds(self):
+        # The commands install.sh --claude-hooks writes, run as Claude Code
+        # runs a hook: in the CLI's environment, the event as JSON on stdin.
+        subprocess.run(["/bin/sh", os.path.join(ROOT, "install.sh"), "--wasm", WASM, "--claude-hooks"], env=self.env,
+                       capture_output=True, check=True)
+        with open(os.path.join(self.env["CLAUDE_CONFIG_DIR"], "settings.json")) as handle:
+            hooks = json.load(handle)["hooks"]
+        command = lambda event: hooks[event][0]["hooks"][0]["command"]
+        client, pane = self.claude_in_first_tab(FAKE_TITLE="Hooked for real")
+        self.elsewhere()
+        wait_for(lambda: self.tab_names()[0] == "Hooked for real", timeout=15, interval=0.5, what="named")
+        env = dict(self.env, ZELLIJ="0", ZELLIJ_SESSION_NAME=SESSION, ZELLIJ_PANE_ID=str(pane))
+        run = lambda event, payload: subprocess.run(["/bin/sh", "-c", command(event)], input=json.dumps(payload), env=env,
+                                                    capture_output=True, text=True, timeout=15)
+        idle = run("Notification", {"hook_event_name": "Notification", "notification_type": "idle_prompt", "message": "waiting"})
+        self.assertEqual((idle.returncode, idle.stdout), (0, ""))
+        time.sleep(4)
+        self.assertEqual(self.tab_names()[0], "Hooked for real")  # a reminder is not a question
+        run("Notification", {"hook_event_name": "Notification", "notification_type": "permission_prompt", "message": "Allow?"})
+        wait_for(lambda: self.tab_names()[0] == "● Hooked for real", timeout=10, interval=0.5, what="needs you, from the hook")
+        self.assertEqual(run("UserPromptSubmit", {"hook_event_name": "UserPromptSubmit", "prompt": "go"}).stdout, "")
+        wait_for(lambda: self.tab_names()[0] == "Hooked for real", timeout=10, interval=0.5, what="cleared")
+        run("Stop", {"hook_event_name": "Stop"})
+        wait_for(lambda: self.tab_names()[0] == "✓ Hooked for real", timeout=10, interval=0.5, what="finished, from the hook")
+        outside = subprocess.run(["/bin/sh", "-c", command("Stop")], input="{}", env=self.box.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual((outside.returncode, outside.stdout, outside.stderr), (0, "", ""))  # nothing outside Zellij
+
+    def test_a_tab_named_by_the_user_keeps_its_name(self):
+        self.start(FAKE_SCREEN=1, FAKE_TITLE="Busy", FAKE_WORK_AFTER=6, FAKE_WORK_FOR=30)
+        self.action("rename-tab", "mine")
+        self.type(self.terminals()[0]["id"], "claude --verbose")
+        self.box.wait_event(event="screen", state="working", timeout=20)
+        time.sleep(5)
+        self.assertEqual(self.tab_names()[0], "mine")
+
+
 class FirstRun(PluginTest):
     def test_granting_once_in_a_pane_starts_the_background_plugin(self):
         for cache in ("Library/Caches/org.Zellij-Contributors.Zellij", ".cache/zellij"):  # never granted
@@ -478,7 +629,7 @@ class FirstRun(PluginTest):
         session = self.box.wait_event(event="start", timeout=15)["session"]
         time.sleep(3)
         self.assertEqual(self.saved(), {})  # the background plugin waits for permission
-        self.zellij("--session", SESSION, "plugin", "--", URL)  # what install.sh says to do
+        self.zellij("--session", SESSION, "plugin", "-c", "grant=true", "--", URL)  # what install.sh says to do
         time.sleep(2)
         os.write(client.master, b"y")
         self.recorded(session)

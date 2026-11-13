@@ -3,6 +3,7 @@ what they do (and refuse to do) to config.kdl.
 
     python3 -m unittest test_install"""
 
+import json
 import os
 import subprocess
 import unittest
@@ -62,7 +63,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(oct(os.stat(self.installed).st_mode & 0o777), "0o644")
         self.assertEqual(self.read_config(), CONFIG)
         self.assertIn(LINE, output)
-        self.assertIn("zellij plugin -- 'file:~/.config/zellij/plugins/zellij-ai-resume.wasm'", output)
+        self.assertIn("zellij plugin -c grant=true -- 'file:~/.config/zellij/plugins/zellij-ai-resume.wasm'", output)
 
     def test_edit_config_fills_the_existing_block_once(self):
         self.write_config(CONFIG)
@@ -116,6 +117,46 @@ class InstallTest(unittest.TestCase):
         self.assertIn(LINE, self.read_config())
         self.run_script("uninstall.sh", "--edit-config")
         self.assertEqual(self.read_config(), CONFIG)
+
+
+class ClaudeHooks(InstallTest):
+    def settings(self):
+        with open(os.path.join(self.box.env["CLAUDE_CONFIG_DIR"], "settings.json")) as handle:
+            return json.load(handle)
+
+    def ours(self, settings):
+        return {event: [hook["command"] for group in groups for hook in group["hooks"] if "zjr-status" in hook["command"]]
+                for event, groups in settings.get("hooks", {}).items()}
+
+    def test_added_once_beside_the_user_s_own(self):
+        os.makedirs(self.box.env["CLAUDE_CONFIG_DIR"])
+        mine = {"model": "opus", "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "say done"}]}]}}
+        with open(os.path.join(self.box.env["CLAUDE_CONFIG_DIR"], "settings.json"), "w") as handle:
+            json.dump(mine, handle)
+        self.assertIn("Added hooks", self.install("--claude-hooks"))
+        settings = self.settings()
+        self.assertEqual(settings["model"], "opus")
+        self.assertEqual(settings["hooks"]["Stop"][0], mine["hooks"]["Stop"][0])  # untouched
+        ours = self.ours(settings)
+        self.assertEqual(sorted(event for event, commands in ours.items() if commands), ["Notification", "Stop", "UserPromptSubmit"])
+        self.assertIn('"$ZELLIJ_PANE_ID done"', ours["Stop"][0])
+        self.assertIn("permission_prompt", ours["Notification"][0])
+        self.assertIn("already has the hooks", self.install("--claude-hooks"))
+        self.assertEqual(self.settings(), settings)
+        self.run_script("uninstall.sh", "--edit-config")
+        self.assertEqual(self.settings(), mine)
+
+    def test_none_without_the_option_and_never_through_a_link(self):
+        self.install()
+        self.assertFalse(os.path.exists(os.path.join(self.box.env["CLAUDE_CONFIG_DIR"], "settings.json")))
+        os.makedirs(self.box.env["CLAUDE_CONFIG_DIR"])
+        source = os.path.join(self.box.dir, "dotfiles-settings.json")
+        with open(source, "w") as handle:
+            handle.write("{}")
+        os.symlink(source, os.path.join(self.box.env["CLAUDE_CONFIG_DIR"], "settings.json"))
+        self.assertIn("symbolic link", self.install("--claude-hooks", ok=False))
+        with open(source) as handle:
+            self.assertEqual(handle.read(), "{}")
 
 
 if __name__ == "__main__":
