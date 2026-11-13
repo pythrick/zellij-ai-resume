@@ -570,6 +570,62 @@ class Agents(PluginTest):
         wait_for(lambda: self.focused_tab() == 0, timeout=10, interval=0.5, what="1 to go to the first agent")
         wait_for(lambda: not inbox(), timeout=10, interval=0.5, what="the inbox to close")
 
+    def test_keys_added_to_config_kdl_reach_attached_clients_at_once(self):
+        # As install.sh --edit-config adds them to a running session's
+        # config.kdl: the client already attached gets them, without the
+        # plugin binding anything (inbox_key ""), and so does a later one.
+        config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
+        with open(config) as handle:
+            text = re.sub(r"\n\nkeybinds \{\n    // zellij-ai-resume: its keys.*?\n    \}\n\}\n", "\n", handle.read(), flags=re.S)
+        self.assertNotIn("zellij-ai-resume: its keys", text)
+        with open(config, "w") as handle:
+            handle.write(text)
+        self.configure(inbox_key="")
+        client = self.start()
+        time.sleep(6)
+        os.write(client.master, b"\x1ba")  # Alt a: nothing binds it yet
+        time.sleep(3)
+        self.assertFalse(self.inbox_open())
+        installed = subprocess.run(["/bin/sh", os.path.join(ROOT, "install.sh"), "--wasm", WASM, "--edit-config"], env=self.env,
+                                   capture_output=True, text=True)
+        self.assertIn("Added the plugin's keys", installed.stdout)
+        time.sleep(4)  # Zellij reloads config.kdl
+        os.write(client.master, b"\x1ba")
+        wait_for(self.inbox_open, timeout=10, interval=0.5, what="Alt a, from config.kdl, in the attached client")
+        os.write(client.master, b"\x1b")
+        wait_for(lambda: not self.inbox_open(), timeout=10, interval=0.5, what="Esc to close the inbox")
+        later = self.attach()
+        time.sleep(4)
+        os.write(later.master, b"\x1ba")
+        wait_for(self.inbox_open, timeout=10, interval=0.5, what="Alt a in a client attached later")
+
+    def inbox_open(self):
+        return any(pane.get("title") == "Agents" for pane in json.loads(self.action("list-panes", "--json", "--all") or "[]"))
+
+    def detach_attach_and_open_the_inbox(self):
+        first = self.start()
+        time.sleep(6)  # the plugin has bound its keys
+        first.close()  # detached
+        time.sleep(2)
+        again = self.attach()
+        time.sleep(4)
+        os.write(again.master, b"\x1ba")  # Alt a
+        wait_for(self.inbox_open, timeout=10, interval=0.5, what="Alt a to open the inbox after re-attaching")
+
+    def test_the_keys_survive_a_re_attach(self):
+        # A client that attaches starts from config.kdl, where install.sh
+        # --edit-config put the keys.
+        self.detach_attach_and_open_the_inbox()
+
+    def test_without_keys_in_config_kdl_the_plugin_binds_them_again(self):
+        config = os.path.join(self.box.home, ".config", "zellij", "config.kdl")
+        with open(config) as handle:
+            text = re.sub(r"\n\nkeybinds \{\n    // zellij-ai-resume: its keys.*?\n    \}\n\}\n", "\n", handle.read(), flags=re.S)
+        self.assertNotIn("zellij-ai-resume: its keys", text)
+        with open(config, "w") as handle:
+            handle.write(text)
+        self.detach_attach_and_open_the_inbox()
+
     def test_hooks_report_through_zellij_pipe(self):
         client, pane = self.claude_in_first_tab(FAKE_TITLE="Hooked")
         self.elsewhere()

@@ -77,6 +77,26 @@ elif [ -f "$config_file" ] && grep -q "$NAME" "$config_file"; then
     grep -n "$NAME" "$config_file"
 fi
 
+# The keys install.sh --edit-config added to config.kdl, from their mark to
+# the end of their block.
+KEYS_MARK='// zellij-ai-resume: its keys (uninstall.sh --edit-config removes them)'
+if [ -f "$config_file" ] && grep -qF "$KEYS_MARK" "$config_file"; then
+    if $edit && [ ! -L "$config_file" ]; then
+        backup=$config_file.before-zellij-ai-resume-uninstall
+        [ -e "$backup" ] || cp -p -- "$config_file" "$backup"
+        tmp=$config_file.zellij-ai-resume.$$
+        trap 'rm -f -- "$tmp"' EXIT
+        cp -p -- "$config_file" "$tmp"
+        awk -v mark="$KEYS_MARK" '$0 == "    " mark { skipping = 1; next }
+            skipping { if ($0 ~ /^    }[ \t]*$/) skipping = 0; next }
+            { print }' "$config_file" >"$tmp"
+        mv -f -- "$tmp" "$config_file"
+        echo "removed the plugin's keys from $config_file"
+    else
+        echo "remove the plugin's keys from the keybinds in $config_file (the block after \"$KEYS_MARK\")"
+    fi
+fi
+
 # Claude Code hooks added by install.sh --claude-hooks (they report to the
 # plugin, and do nothing without it).
 settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json

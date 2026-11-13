@@ -94,7 +94,7 @@ fi
 mkdir -p -- "$config_dir/plugins"
 target=$config_dir/plugins/$NAME
 tmp=$config_dir/plugins/.$NAME.$$
-trap 'rm -f -- "$tmp"' EXIT
+trap 'rm -f -- "$tmp" "$tmp.keys"' EXIT
 cp -- "$wasm" "$tmp"
 chmod 644 "$tmp"
 mv -f -- "$tmp" "$target"
@@ -109,6 +109,34 @@ entry="    \"$url\""
 show_lines() {
     printf '\n    load_plugins {\n    %s\n    }\n\n' "$entry"
     echo "(put the line inside the load_plugins block if there is one already; Zellij reads only one)"
+}
+
+# The plugin's keys, for every client: a plugin can bind keys only for one
+# client (the one it started with), so they belong in config.kdl.
+KEYS_MARK='// zellij-ai-resume: its keys (uninstall.sh --edit-config removes them)'
+keys() {
+    cat <<KEYS
+    $KEYS_MARK
+    shared_except "locked" {
+        bind "Alt r" { MessagePlugin { name "zjr-reload"; payload "reload"; }; }
+        bind "Alt u" { MessagePlugin { name "zjr-next"; payload "next"; }; }
+        bind "Alt a" { LaunchOrFocusPlugin "$url" { floating true; move_to_focused_tab true; mode "inbox"; }; }
+    }
+KEYS
+}
+
+# A copy of config.kdl as it was before this run changed it (never over an
+# older copy).
+backup=
+keep_copy() {
+    [ -z "$backup" ] || return 0
+    backup=$config_file.before-zellij-ai-resume
+    n=1
+    while [ -e "$backup" ]; do
+        n=$((n + 1))
+        backup=$config_file.before-zellij-ai-resume.$n
+    done
+    cp -p -- "$config_file" "$backup"
 }
 
 loaded=$( [ -f "$config_file" ] && grep -E '^[[:space:]]*"file:[^"]*/zellij-ai-resume\.wasm"' "$config_file" | head -n 1 || true)
@@ -138,9 +166,8 @@ else
         echo "$config_file has a load_plugins block this script does not edit. Add, inside it:"
         echo "$entry"
     else
-        backup=$config_file.before-zellij-ai-resume
+        keep_copy
         tmp=$config_file.zellij-ai-resume.$$
-        cp -p -- "$config_file" "$backup"
         cp -p -- "$config_file" "$tmp"
         if [ "$blocks" -eq 1 ]; then
             awk -v entry="$entry" '{ print } !done && /^load_plugins[ \t]*[{][ \t]*$/ { print entry; done = 1 }' "$config_file" >"$tmp"
@@ -149,6 +176,41 @@ else
         fi
         mv -f -- "$tmp" "$config_file"
         echo "Added it to load_plugins in $config_file (the file as it was: $backup)"
+    fi
+fi
+
+if [ -f "$config_file" ] && grep -qF "$KEYS_MARK" "$config_file"; then
+    echo "$config_file already has the plugin's keys"
+elif ! $edit || [ -L "$config_file" ] || [ ! -f "$config_file" ]; then
+    echo "For its keys (Alt r reload, Alt u next agent, Alt a agents) in every Zellij client, add inside"
+    echo "the keybinds block of $config_file:"
+    echo
+    keys
+    echo
+else
+    opening=$(grep -cE '^keybinds([[:space:]].*)?[{][[:space:]]*$' "$config_file" || true)
+    blocks=$(grep -cE '^keybinds([[:space:]{]|$)' "$config_file" || true)
+    tmp=$config_file.zellij-ai-resume.$$
+    if [ "$blocks" -eq 0 ]; then
+        keep_copy
+        cp -p -- "$config_file" "$tmp"
+        { cat -- "$config_file"; printf '\nkeybinds {\n'; keys; printf '}\n'; } >"$tmp"
+    elif [ "$blocks" -eq 1 ] && [ "$opening" -eq 1 ]; then
+        keep_copy
+        cp -p -- "$config_file" "$tmp"
+        keys >"$tmp.keys"
+        awk -v block="$tmp.keys" '{ print } !done && /^keybinds([ \t].*)?[{][ \t]*$/ {
+            while ((getline line < block) > 0) print line
+            done = 1
+        }' "$config_file" >"$tmp"
+        rm -f -- "$tmp.keys"
+    fi
+    if [ -f "$tmp" ]; then
+        mv -f -- "$tmp" "$config_file"
+        echo "Added the plugin's keys (Alt r, Alt u, Alt a) to the keybinds in $config_file (the file as it was: $backup)"
+    else
+        echo "$config_file has a keybinds block this script does not edit. Add, inside it:"
+        keys
     fi
 fi
 

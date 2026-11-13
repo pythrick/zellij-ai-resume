@@ -52,10 +52,12 @@ Requirements:
    Zellij reads only the first `load_plugins` block, so if you already have
    one, put the line inside it.
 
-`--edit-config` does that step for you:
+`--edit-config` does that step for you, and adds the plugin's keys (see
+[Reload](#reload)):
 - It fills in an existing `load_plugins { ... }` block, adds one, or creates
-  `config.kdl`.
-- It keeps the file as it was in `config.kdl.before-zellij-ai-resume`.
+  `config.kdl`; it puts the keys inside your `keybinds` block, or adds one.
+- It keeps the file as it was in `config.kdl.before-zellij-ai-resume` (or
+  `….2`, `….3` when an older copy is there).
 - It leaves a symlinked `config.kdl` alone (for managed dotfiles), and any
   block it cannot edit safely.
 
@@ -86,7 +88,7 @@ pane maps.
 | Path | What |
 |---|---|
 | `~/.config/zellij/plugins/zellij-ai-resume.wasm` | the plugin (or under your `ZELLIJ_CONFIG_DIR`) |
-| `config.kdl` | one line in `load_plugins`, added by you or by `--edit-config` |
+| `config.kdl` | one line in `load_plugins` and the plugin's keys, added by you or by `--edit-config` |
 | Zellij's cache folder | Zellij's own `permissions.kdl` entry, and the plugin's folder: one small JSON map per session (deleted after 30 days unused), the agents' state for the inbox, and a note that reading pane contents was granted |
 | Claude Code's `settings.json` | only with `--claude-hooks`: three hooks (see [Agents](#agents)) |
 
@@ -117,8 +119,13 @@ How it starts again depends on the pane:
   by a `cd` if the shell is not in the CLI's directory.
 - A resurrected pane is replaced in place.
 
-The binding is added to the running session, not written to your
-configuration.
+The keys (Alt r, Alt u, Alt a) belong in `config.kdl`, where every Zellij
+client gets them; `install.sh --edit-config` adds them inside your
+`keybinds` block, marked so that `uninstall.sh --edit-config` takes exactly
+them out again, and prints them otherwise. Zellij keeps a key a plugin binds
+for one client only, and a client that attaches starts from `config.kdl`, so
+without them there the plugin binds its keys again whenever a client
+attaches: enough for one terminal, not for several at once.
 
 ## Agents
 

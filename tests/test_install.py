@@ -11,6 +11,13 @@ import unittest
 from helpers import ROOT, Sandbox
 
 LINE = '    "file:~/.config/zellij/plugins/zellij-ai-resume.wasm"'
+KEYS = """    // zellij-ai-resume: its keys (uninstall.sh --edit-config removes them)
+    shared_except "locked" {
+        bind "Alt r" { MessagePlugin { name "zjr-reload"; payload "reload"; }; }
+        bind "Alt u" { MessagePlugin { name "zjr-next"; payload "next"; }; }
+        bind "Alt a" { LaunchOrFocusPlugin "file:~/.config/zellij/plugins/zellij-ai-resume.wasm" { floating true; move_to_focused_tab true; mode "inbox"; }; }
+    }
+"""
 CONFIG = """// my settings
 keybinds clear-defaults=true {
     normal {
@@ -63,32 +70,52 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(oct(os.stat(self.installed).st_mode & 0o777), "0o644")
         self.assertEqual(self.read_config(), CONFIG)
         self.assertIn(LINE, output)
+        self.assertIn(KEYS, output)  # the keys too, to add by hand
         self.assertIn("zellij plugin -c grant=true -- 'file:~/.config/zellij/plugins/zellij-ai-resume.wasm'", output)
 
     def test_edit_config_fills_the_existing_block_once(self):
         self.write_config(CONFIG)
         self.install("--edit-config")
-        self.assertEqual(self.read_config(), CONFIG.replace("load_plugins {\n", "load_plugins {\n" + LINE + "\n"))
+        expected = CONFIG.replace("load_plugins {\n", "load_plugins {\n" + LINE + "\n")
+        expected = expected.replace("keybinds clear-defaults=true {\n", "keybinds clear-defaults=true {\n" + KEYS)
+        self.assertEqual(self.read_config(), expected)
         with open(self.config + ".before-zellij-ai-resume") as handle:
             self.assertEqual(handle.read(), CONFIG)
         edited = self.read_config()
-        self.assertIn("already loads it", self.install("--edit-config"))
+        output = self.install("--edit-config")
+        self.assertIn("already loads it", output)
+        self.assertIn("already has the plugin's keys", output)
         self.assertEqual(self.read_config(), edited)
+        self.assertFalse(os.path.exists(self.config + ".before-zellij-ai-resume.2"))  # nothing changed, no copy
 
     def test_edit_config_adds_a_block_or_a_file(self):
         self.write_config('theme "dracula"\n')
         self.install("--edit-config")
-        self.assertEqual(self.read_config(), f'theme "dracula"\n\nload_plugins {{\n{LINE}\n}}\n')
+        self.assertEqual(self.read_config(), f'theme "dracula"\n\nload_plugins {{\n{LINE}\n}}\n\nkeybinds {{\n{KEYS}}}\n')
         os.unlink(self.config)
         self.install("--edit-config")
-        self.assertEqual(self.read_config(), f"load_plugins {{\n{LINE}\n}}\n")
+        self.assertEqual(self.read_config(), f"load_plugins {{\n{LINE}\n}}\n\nkeybinds {{\n{KEYS}}}\n")
+
+    def test_an_older_copy_is_never_overwritten(self):
+        self.write_config(CONFIG)
+        with open(self.config + ".before-zellij-ai-resume", "w") as handle:
+            handle.write("the very first one")
+        self.install("--edit-config")
+        with open(self.config + ".before-zellij-ai-resume") as handle:
+            self.assertEqual(handle.read(), "the very first one")
+        with open(self.config + ".before-zellij-ai-resume.2") as handle:
+            self.assertEqual(handle.read(), CONFIG)
 
     def test_configs_it_cannot_edit_safely_are_left_alone(self):
         for text in ('load_plugins { "file:/x.wasm"; }\n', "load_plugins {\n}\nload_plugins {\n}\n"):
             self.write_config(text)
             output = self.install("--edit-config")
-            self.assertEqual(self.read_config(), text)
+            self.assertTrue(self.read_config().startswith(text))  # load_plugins as it was; only keys after it
             self.assertIn(LINE, output)
+            os.unlink(self.config + ".before-zellij-ai-resume")
+        self.write_config("keybinds { normal { bind \"x\" { Quit; }; }; }\n")  # a block on one line
+        self.assertIn("keybinds block this script does not edit", self.install("--edit-config"))
+        self.assertNotIn("zellij-ai-resume: its keys", self.read_config())
         os.unlink(self.config)
         source = os.path.join(self.box.dir, "dotfiles-config.kdl")
         with open(source, "w") as handle:

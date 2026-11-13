@@ -411,6 +411,9 @@ impl ZellijPlugin for State {
             Event::SessionUpdate(sessions, _) => {
                 if let Some(current) = sessions.iter().find(|session| session.is_current_session) {
                     self.session = Some(current.name.clone());
+                    if current.connected_clients > self.clients {
+                        self.bound = false; // an attaching client starts from config.kdl: bind again
+                    }
                     self.clients = current.connected_clients;
                 }
             }
@@ -587,6 +590,7 @@ impl State {
                                                    PathBuf::from("/data"), context);
             self.origin_sent = Some(Instant::now());
         }
+        self.bind_keys();
         if self.origin.is_none() && self.origin_sent.map_or(false, |sent| sent.elapsed() > STALE_COMMAND) {
             self.note("no answer about this server: restoring only panes Zellij kept waiting".to_string());
             self.origin = Some(Origin::default());
@@ -617,9 +621,12 @@ impl State {
     }
 
     /// Bind the plugin's keys for this session (not written to the config
-    /// file): reload, next agent, inbox. Through `reconfigure`: Zellij 0.45
-    /// drops a KeybindPipe's name and payload when a plugin binds it with
-    /// `rebind_keys`.
+    /// file): reload, next agent, inbox. Zellij keeps such bindings for one
+    /// client only (the plugin's), and a client that attaches starts from
+    /// config.kdl, so they are bound again whenever one attaches; install.sh
+    /// --edit-config puts them in config.kdl, for every client. Through
+    /// `reconfigure`: Zellij 0.45 drops a KeybindPipe's name and payload when
+    /// a plugin binds it with `rebind_keys`.
     fn bind_keys(&mut self) {
         if self.bound {
             return;
