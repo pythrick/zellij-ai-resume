@@ -20,6 +20,11 @@
 //! exits keeps its place in the map for a while (`exit_grace`), and Zellij's
 //! last save may show a shell where it ran. Such a shell is replaced too, but
 //! only in a session Zellij resurrected, laid out as the map describes.
+//!
+//! Zellij shows the title of a tab's only pane (Claude Code's conversation
+//! title) as the tab's name while the tab has its default name. A resurrected
+//! tab gets "Tab #3" back as a name of its own, so its tab bar entry stops
+//! following the pane; once the session is restored, such tabs get new ones.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -38,11 +43,15 @@ const RESTORE_WINDOW: Duration = Duration::from_secs(30);
 const RELOAD_GRACE: Duration = Duration::from_secs(5);
 const RELOAD_GIVE_UP: Duration = Duration::from_secs(12);
 const STALE_COMMAND: Duration = Duration::from_secs(15);
+/// How long panes moving to new tabs take to settle; meanwhile the layout is
+/// half old, half new, and must not be saved.
+const MOVE_SETTLE: Duration = Duration::from_secs(3);
 /// How long an exited CLI keeps its entry (configurable as `exit_grace`).
 const EXIT_GRACE: Duration = Duration::from_secs(60);
 const MAP_FORMAT: u32 = 1;
 const MAP_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const PIPE_NAME: &str = "zjr-reload";
+const TABS_PIPE: &str = "zjr-tabs";
 /// Marks the commands that enter their directory themselves (see `command_in`).
 const MARKER: &str = "zellij-ai-resume";
 /// What an idle pane runs: a shell, which a restore may replace.
@@ -207,6 +216,11 @@ struct Reload {
 struct State {
     reload_key: String,
     exit_grace: Duration,
+    tab_titles: bool,
+    tabs_renewed: bool, // this server's tabs were given back their titles (or needed not)
+    renew_tabs: bool,   // asked for through `zellij pipe --name zjr-tabs`
+    moving_until: Option<Instant>, // panes are moving to new tabs until then
+    save_after_move: bool,
     plugin_id: u32,
     granted: bool,
     session: Option<String>,
@@ -240,6 +254,7 @@ impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.reload_key = configuration.get("reload_key").cloned().unwrap_or_else(|| "Alt r".to_string());
         self.exit_grace = EXIT_GRACE;
+        self.tab_titles = configuration.get("tab_titles").map_or(true, |value| value.trim() != "false");
         if let Some(text) = configuration.get("exit_grace") {
             match text.trim().parse::<u64>() {
                 Ok(seconds) => self.exit_grace = Duration::from_secs(seconds),
@@ -337,11 +352,15 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
-        if message.name != PIPE_NAME {
+        if message.name != PIPE_NAME && message.name != TABS_PIPE {
             return false;
         }
         if let PipeSource::Cli(pipe_id) = &message.source {
             unblock_cli_pipe_input(pipe_id); // or `zellij pipe` waits forever
+        }
+        if message.name == TABS_PIPE {
+            self.renew_tabs = true; // done at the next tick, once nothing is being restored
+            return false;
         }
         // `zellij pipe` with a non-terminal stdin (`! zellij pipe ...` inside
         // Claude Code) ends with an empty message: not a second request.
@@ -442,6 +461,15 @@ impl State {
             self.restore();
         }
         self.advance_reloads();
+        if !self.restoring() && self.origin.is_some() {
+            let resurrected = self.origin.as_ref().map_or(false, |origin| origin.layout) && !self.same_server();
+            if self.renew_tabs || (resurrected && self.tab_titles && !self.tabs_renewed) {
+                self.renew_tabs = false;
+                self.tabs_renewed = true;
+                self.give_tabs_their_titles();
+            }
+            self.tabs_renewed = true;
+        }
         if self.probe_sent.map_or(true, |sent| sent.elapsed() > STALE_COMMAND) {
             self.probe();
         }
@@ -471,13 +499,17 @@ impl State {
 
     // --- restoring a resurrected session ------------------------------------------------
 
+    /// Whether this server wrote the saved map: the plugin restarted in a
+    /// running session.
+    fn same_server(&self) -> bool {
+        let server = self.origin.as_ref().and_then(|origin| origin.server.as_ref());
+        server.is_some() && self.saved.as_ref().and_then(|saved| saved.server.as_ref()) == server
+    }
+
     /// Whether this plugin may restore anything: not when this server wrote
-    /// the map (the plugin restarted in a running session).
+    /// the map.
     fn may_restore(&self) -> bool {
-        match (&self.origin, &self.saved) {
-            (Some(origin), Some(saved)) => origin.server.is_none() || saved.server != origin.server,
-            _ => false,
-        }
+        self.origin.is_some() && self.saved.is_some() && !self.same_server()
     }
 
     /// Whether panes Zellij brought back as shells may be restored: only in a
@@ -566,6 +598,43 @@ impl State {
             let shell = if restore.shell { " (Zellij kept a shell there)" } else { "" };
             self.note(format!("restored {}{shell} as {} {} in {} ({opened:?})", restore.key, tool.name(), args.join(" "), entry.cwd));
         }
+    }
+
+    /// Move the pane of each tab still called "Tab #<n>" with that pane alone
+    /// in it to a new tab, which Zellij names by default again, so the tab bar
+    /// shows the pane's title. New tabs go last: only the run of such tabs at
+    /// the end moves, which keeps the order. The focused tab stays focused.
+    fn give_tabs_their_titles(&mut self) {
+        let mut tabs = self.tabs.clone();
+        tabs.sort_by_key(|tab| tab.position);
+        let mut moving: Vec<(u32, bool)> = Vec::new();
+        for tab in tabs.iter().rev() {
+            match lone_pane(tab, self.panes.get(&tab.position).map(Vec::as_slice).unwrap_or(&[])) {
+                Some(pane) => moving.push((pane, tab.active)),
+                None => break,
+            }
+        }
+        moving.reverse();
+        if moving.is_empty() {
+            let seen: Vec<String> = tabs.iter().map(|tab| {
+                let panes = self.panes.get(&tab.position).map(Vec::as_slice).unwrap_or(&[]);
+                let summary: Vec<String> = panes.iter().map(|pane| format!("{}{}{}{}", if pane.is_plugin { "plugin" } else { "terminal" },
+                    if pane.is_floating { ",floating" } else { "" }, if pane.is_suppressed { ",suppressed" } else { "" },
+                    if pane.is_plugin && pane.is_selectable { ",selectable" } else { "" })).collect();
+                format!("{:?} [{}]", tab.name, summary.join(" "))
+            }).collect();
+            self.note(format!("no tab at the end to give its pane's title back: {}", seen.join(", ")));
+            return;
+        }
+        for (pane, active) in &moving {
+            break_panes_to_new_tab(&[PaneId::Terminal(*pane)], None, *active);
+        }
+        if let Some((pane, _)) = moving.iter().find(|(_, active)| *active) {
+            focus_terminal_pane(*pane, false, false);
+        }
+        self.moving_until = Some(Instant::now() + MOVE_SETTLE);
+        self.save_after_move = true;
+        self.note(format!("{} tab(s) show their pane's title again", moving.len()));
     }
 
     // --- following the CLIs -------------------------------------------------------------
@@ -733,6 +802,9 @@ impl State {
         let Some(server) = self.origin.as_ref().map(|origin| origin.server.clone()) else {
             return; // not before knowing what there is to restore
         };
+        if self.moving_until.map_or(false, |until| Instant::now() < until) {
+            return; // nor while tabs are half moved
+        }
         if self.loaded.is_none() {
             return;
         }
@@ -762,6 +834,9 @@ impl State {
         let map = Map { format: MAP_FORMAT, panes, server, shape: shape(&self.panes) };
         let moved = map.shape != self.written_shape;
         let Ok(text) = serde_json::to_string_pretty(&map) else { return };
+        if std::mem::take(&mut self.save_after_move) {
+            let _ = save_session(); // the layout as the moves left it
+        }
         if self.written.as_deref() == Some(text.as_str()) {
             return;
         }
@@ -932,6 +1007,16 @@ fn signal(pids: &[i32], name: &str) {
     let mut command = vec!["kill".to_string(), format!("-{name}")];
     command.extend(pids.iter().map(i32::to_string));
     run(&command, "signal");
+}
+
+/// The pane of a tab that Zellij would name after it: a tab still called by
+/// a default name, with one tiled terminal pane and no other pane to select.
+fn lone_pane(tab: &TabInfo, panes: &[PaneInfo]) -> Option<u32> {
+    let default_name = tab.name.strip_prefix("Tab #").map_or(false, |n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let mut terminals = panes.iter().filter(|pane| !pane.is_plugin && !pane.is_suppressed);
+    let pane = terminals.next()?;
+    let alone = terminals.next().is_none() && panes.iter().all(|other| !other.is_plugin || !other.is_selectable || other.is_suppressed);
+    (default_name && alone && !pane.is_floating).then_some(pane.id)
 }
 
 /// Whether a pane Zellij holds waits to run `tool`.
@@ -1220,6 +1305,24 @@ mod tests {
         // Maps written before the server and shape were recorded still load.
         let old: Map = serde_json::from_str(r#"{"format": 1, "panes": {}}"#).unwrap();
         assert_eq!((old.server, old.shape), (None, vec![]));
+    }
+
+    #[test]
+    fn tabs_named_by_default_with_one_pane() {
+        let tab = |name: &str| TabInfo { name: name.into(), ..Default::default() };
+        let bar = PaneInfo { id: 5, is_plugin: true, is_selectable: false, ..Default::default() };
+        let one = vec![terminal(3), bar.clone()];
+        assert_eq!(lone_pane(&tab("Tab #3"), &one), Some(3));
+        assert_eq!(lone_pane(&tab("Tab #12"), &one), Some(3));
+        assert_eq!(lone_pane(&tab("work"), &one), None); // named by the user
+        assert_eq!(lone_pane(&tab("Tab #"), &one), None);
+        assert_eq!(lone_pane(&tab("Tab #3"), &[terminal(3), terminal(4), bar.clone()]), None); // a split
+        let floating = PaneInfo { is_floating: true, ..terminal(4) };
+        assert_eq!(lone_pane(&tab("Tab #3"), &[terminal(3), floating]), None);
+        let grant = PaneInfo { id: 6, is_plugin: true, is_selectable: true, is_floating: true, ..Default::default() };
+        assert_eq!(lone_pane(&tab("Tab #3"), &[terminal(3), grant]), None);
+        let background = PaneInfo { id: 0, is_plugin: true, is_selectable: true, is_suppressed: true, ..Default::default() };
+        assert_eq!(lone_pane(&tab("Tab #1"), &[terminal(3), bar, background]), Some(3));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 #
 #   brew install container && container system start
 #   tests/run-linux.sh
+#   ZJR_TESTS=test_plugin.TabTitles tests/run-linux.sh   # some of them
 #
 # The host downloads the packages and the VM installs them offline, so this
 # also works where the VM has no network of its own (a corporate proxy or VPN
@@ -18,6 +19,7 @@ set -euo pipefail
 image=${ZJR_LINUX_IMAGE:-docker.io/menci/archlinuxarm:latest}
 mirror=${ZJR_ALARM_MIRROR:-http://mirror.archlinuxarm.org/aarch64}
 packages="python procps-ng dash zellij"
+tests=${ZJR_TESTS:-test_install test_plugin}  # or some of them: ZJR_TESTS=test_plugin.TabTitles
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -55,7 +57,11 @@ for sh in bash dash; do
     for file in install.sh uninstall.sh; do
         /bin/sh -n /home/tester/zjr/\$file || status=1
     done
-    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 ZJR_PLUGIN_WASM=/home/tester/zjr/plugin/zellij-ai-resume.wasm python3 -W error::DeprecationWarning -m unittest test_install test_plugin' || status=1
+    su tester -c 'cd ~/zjr/tests && ZJR_E2E=1 ZJR_PLUGIN_WASM=/home/tester/zjr/plugin/zellij-ai-resume.wasm python3 -W error::DeprecationWarning -m unittest $tests' || {
+        status=1
+        echo "-- the plugin's notes:"
+        grep -ah 'zellij-ai-resume:' /tmp/zellij-*/zellij-log/zellij.log | cut -c 90- | tail -40
+    }
 done
 exit \$status
 EOF

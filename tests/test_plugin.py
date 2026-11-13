@@ -309,7 +309,7 @@ class Resurrection(PluginTest):
 
     def test_a_cli_quit_well_before_the_end_stays_quit(self):
         self.configure(exit_grace=2)
-        self.start(FAKE_EXIT_AFTER=2)
+        self.start(FAKE_EXIT_AFTER=6)  # long enough to be seen running first
         self.type(self.terminals()[0]["id"], "claude --verbose")
         self.recorded(self.box.wait_event(event="start", timeout=15)["session"])
         self.box.wait_event(event="exit", timeout=10)
@@ -373,6 +373,99 @@ class Upgrade(PluginTest):
         self.type(pane, "FAKE_EXIT_AFTER= claude --model two")  # and it follows what starts next
         self.recorded(self.box.wait_event(event="start", skip=1, timeout=15)["session"])
 
+
+class TabTitles(PluginTest):
+    # Zellij shows the title of a tab's only pane as the tab's name while the
+    # tab has its default name; a resurrected tab's saved "Tab #2" counts as a
+    # name of its own. A title is set the way Claude Code keeps one: by a
+    # program in the foreground (a shell's prompt may set its own, as Arch's
+    # does). It is set in parts, so that only the tab bar shows it whole.
+
+    def title(self, pane, text):
+        head, tail = text[:-1], text[-1]
+        self.type(pane, f"printf '\\033]0;%s%s\\007' {head} {tail}; sleep 600")
+
+    def tab_bar_shows(self, client, since, *titles):
+        text = client.output[since:].decode("utf-8", "replace")
+        return all(title in text for title in titles)
+
+    def tabs(self):
+        return [line.split()[2:] for line in self.action("list-tabs", "--state").strip().splitlines()[1:]]
+
+    def three_tabs(self):
+        for _ in range(2):
+            self.action("new-tab", "--cwd", self.box.work)
+            time.sleep(0.5)  # a burst of actions can stall a Zellij server
+        wait_for(lambda: len(self.terminals()) == 3, interval=0.5, what="three tabs")
+        self.action("go-to-tab", "2")
+        time.sleep(0.5)
+
+    def test_after_a_resurrection_tabs_show_their_pane_titles_again(self):
+        self.start()
+        self.three_tabs()
+        time.sleep(2)
+        client = self.crash_and_attach()
+        panes = wait_for(lambda: len(self.terminals()) == 3 and sorted(p["id"] for p in self.terminals()), interval=0.5,
+                         what="the tabs back")
+        self.assertEqual([tab[0] for tab in self.tabs()], ["Tab", "Tab", "Tab"])
+        since = len(client.output)
+        for index, pane in enumerate(panes):
+            self.title(pane, f"tab-title-{index}")
+        wait_for(lambda: self.tab_bar_shows(client, since, "tab-title-0", "tab-title-1", "tab-title-2"), timeout=50,
+                 interval=1, what="the tab bar to show the panes' titles")
+        self.assertEqual([(p["id"], p["tab_position"]) for p in sorted(self.terminals(), key=lambda p: p["id"])],
+                         [(pane, index) for index, pane in enumerate(panes)])  # same order
+        self.assertEqual([tab[2] for tab in self.tabs()], ["false", "true", "false"])  # the second still focused
+
+    def test_on_request_and_never_for_a_tab_named_by_the_user(self):
+        client = self.start()
+        self.three_tabs()
+        for tab, name in ((1, "work"), (2, "Tab #12"), (3, "Tab #13")):  # the last two as a resurrection names them
+            self.action("go-to-tab", str(tab))
+            time.sleep(0.3)
+            self.action("rename-tab", name)
+            time.sleep(0.3)
+        panes = sorted(p["id"] for p in self.terminals())
+        since = len(client.output)
+        for index, pane in enumerate(panes):
+            self.title(pane, f"tab-title-{index}")
+        time.sleep(2)
+        self.assertFalse(self.tab_bar_shows(client, since, "tab-title-1"))
+        self.zellij("--session", SESSION, "pipe", "--name", "zjr-tabs")  # done once the restore window is over
+        wait_for(lambda: self.tab_bar_shows(client, since, "tab-title-1", "tab-title-2"), timeout=50, interval=1,
+                 what="the tab bar to show the titles")
+        names = [tab[0] for tab in self.tabs()]
+        self.assertEqual(names[0], "work")
+        self.assertNotIn("#12", " ".join(names))
+        self.assertEqual([p["tab_position"] for p in sorted(self.terminals(), key=lambda p: p["id"])], [0, 1, 2])
+
+
+    def test_a_session_whose_tabs_were_moved_comes_back_right(self):
+        # Resurrected, the tabs move to new ones (new ids, by the plugin);
+        # the next resurrection must still find each CLI at its position.
+        self.start()
+        self.three_tabs()
+        for index, pane in enumerate(sorted(p["id"] for p in self.terminals())):
+            self.type(pane, f"claude --model m{index}")
+        starts = wait_for(lambda: len(self.starts()) == 3 and self.starts(), timeout=15, what="three CLIs")
+        for start in starts:
+            self.recorded(start["session"])
+        self.crash_and_attach()
+        wait_for(lambda: len(self.starts()) == 6, timeout=25, what="all three back")
+        tab_ids = lambda: [line.split()[0] for line in self.action("list-tabs").strip().splitlines()[1:]]
+        ids_before = tab_ids()
+        wait_for(lambda: tab_ids() != ids_before and len(tab_ids()) == 3, timeout=50, interval=1,
+                 what="the panes to move to new tabs")
+        model_at = lambda: {key: entry["args"][entry["args"].index("--model") + 1] for key, entry in self.saved().items()}
+        wait_for(lambda: model_at() == {"0:0": "m0", "1:0": "m1", "2:0": "m2"}, timeout=10, what="the map at the same positions")
+        self.crash_and_attach()
+        wait_for(lambda: len(self.starts()) == 9, timeout=25, what="all three back again")
+        session_of = {start["argv"][1]: start["session"] for start in starts}
+        for start in self.starts()[6:]:
+            model = start["argv"][3]
+            self.assertEqual(start["argv"][:2], ["--resume", session_of[model]])
+        self.assertEqual(len(self.terminals()), 3)
+        wait_for(lambda: model_at() == {"0:0": "m0", "1:0": "m1", "2:0": "m2"}, timeout=10, what="each at its position")
 
 class FirstRun(PluginTest):
     def test_granting_once_in_a_pane_starts_the_background_plugin(self):

@@ -112,6 +112,7 @@ load_plugins {
     "file:~/.config/zellij/plugins/zellij-ai-resume.wasm" {
         reload_key "Ctrl Alt r"
         exit_grace "60"
+        tab_titles "true"
     }
 }
 ```
@@ -120,6 +121,7 @@ load_plugins {
 |---|---|---|
 | `reload_key` | `Alt r` | the reload key; `""` for none |
 | `exit_grace` | `60` | seconds an exited CLI is still brought back if its session ends meanwhile (see [Shutdowns](#shutdowns-and-logouts)) |
+| `tab_titles` | `true` | after a resurrection, let tabs show their pane's title again (see [Tab names](#tab-names)); `"false"` to leave tabs as Zellij restores them |
 
 ## How it works
 
@@ -183,6 +185,32 @@ too, but only when all of these hold:
 
 A CLI you quit more than `exit_grace` before the session ended stays quit.
 
+### Tab names
+
+Zellij 0.45 shows the title of a tab's only pane as the tab's name while the
+tab still has its default name. Claude Code titles its pane with the
+conversation, so such tabs read "Blaze Service Issues" rather than "Tab #3".
+
+Zellij saves each tab's name, the default "Tab #3" included, and a
+resurrected tab gets it back as a name of its own. Its tab bar entry then
+stays "Tab #3" for good.
+
+Once a resurrected session is restored (after the 30-second restore window),
+the plugin moves the pane of each tab still called "Tab #<n>" into a new tab.
+Zellij gives a new tab a default name, so the tab shows its pane's title
+again. Nothing else changes:
+- the panes, and the CLIs in them, keep running;
+- the order of the tabs stays the same, and the focused tab stays focused;
+- the new tabs get new numbers (Zellij numbers tabs as it creates them).
+
+This only applies to tabs with a single pane and no floating panes, as
+Zellij shows titles only for those. New tabs go last, so only the run of such
+tabs at the end of the tab bar is moved: a tab you named, or one with
+splits, keeps every tab before it as it is.
+
+`zellij pipe --name zjr-tabs` does the same at any time, in a session the
+plugin did not restore itself (after upgrading the plugin, say).
+
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured. When several copies of
 the plugin run in one session (the background one and one opened in a pane),
 the one with the lowest id does the work.
@@ -212,8 +240,8 @@ The plugin asks for six permissions:
 | RunCommands | the read-only scripts above, and `kill` for reload |
 | WriteToStdin | typing the command at a shell prompt on reload |
 | Reconfigure | binding the reload key for the session |
-| ReadCliPipes | `zellij pipe --name zjr-reload` |
-| ChangeApplicationState | replacing a pane in place, saving the session, waking the background copy after the grant |
+| ReadCliPipes | `zellij pipe --name zjr-reload` and `--name zjr-tabs` |
+| ChangeApplicationState | replacing a pane in place, moving a pane to a new tab (for its title), saving the session, waking the background copy after the grant |
 
 - **No network access.**
 - **Values never become shell code.** Commands are argument vectors. The
